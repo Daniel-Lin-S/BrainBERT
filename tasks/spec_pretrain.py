@@ -56,6 +56,8 @@ class SpecPretrain(BaseTask):
     def output_logs(
         self, train_logging_outs, val_logging_outs, writer, global_step
     ):
+        if writer is None:
+            return
         for k in train_logging_outs["images"]:
             image = train_logging_outs["images"][k]
             if k == "wav":

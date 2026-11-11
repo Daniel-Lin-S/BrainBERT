@@ -52,6 +52,9 @@ This command expects the Brain Treebank data to have the following structure:
 ```
 
 ### BrainBERT pre-training
+
+For shared fits, local storage configuration, and campaign tracking, see
+[managed pre-training](docs/experiments.md).
 ```
 python3 run_train.py +exp=spec2vec ++exp.runner.device=cuda ++exp.runner.multi_gpu=True \
   ++exp.runner.num_workers=64 +data=masked_spec +model=masked_tf_model_large \

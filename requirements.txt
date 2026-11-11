@@ -13,3 +13,4 @@ scikit-learn
 tensorboard
 torch_optimizer
 tables
+pytz

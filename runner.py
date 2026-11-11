@@ -8,6 +8,8 @@ loss. A negative checkpoint interval disables disk saves, not model selection.
 """
 
 import copy
+from pathlib import Path
+from util.experiments.storage import atomic_write
 from tqdm.contrib.logging import logging_redirect_tqdm
 import numpy as np
 import os
@@ -27,13 +29,38 @@ class Runner:
         self.model = model
         self.task = task
         self.evaluator = None
+        self.status_callback = None
+        self.completed_steps = 0
         self.device = cfg.device
         self.criterion = criterion
-        self.exp_dir = os.getcwd()
+        self.exp_dir = str(
+            Path(cfg.get("artifact_dir", os.getcwd())).resolve()
+        )
+        Path(self.exp_dir).mkdir(parents=True, exist_ok=True)
+        fraction = cfg.get("gpu_memory_fraction")
+        if fraction is not None and str(self.device).startswith("cuda"):
+            if not 0 < fraction <= 1:
+                raise ValueError("gpu_memory_fraction must lie in (0, 1].")
+            devices = (
+                range(torch.cuda.device_count())
+                if cfg.multi_gpu
+                else [
+                    (
+                        torch.device(self.device).index
+                        if torch.device(self.device).index is not None
+                        else torch.cuda.current_device()
+                    )
+                ]
+            )
+            for device in devices:
+                torch.cuda.set_per_process_memory_fraction(fraction, device)
+            torch.cuda.reset_peak_memory_stats()
         self.output_tb = cfg.get("output_tb", True)
         self.logger = None
         if self.output_tb:
-            self.logger = SummaryWriter(self.exp_dir)
+            self.logger = SummaryWriter(
+                str(Path(self.exp_dir) / "tensorboard")
+            )
 
         if cfg.multi_gpu:
             self.model = torch.nn.DataParallel(self.model)
@@ -44,7 +71,10 @@ class Runner:
         self.scheduler = build_scheduler(self.cfg.scheduler, self.optim)
         total_steps = self.cfg.total_steps
         self.progress = tqdm(
-            total=total_steps, dynamic_ncols=True, desc="overall"
+            total=total_steps,
+            dynamic_ncols=True,
+            desc="overall",
+            disable=cfg.get("quiet", False),
         )
 
         if "start_from_ckpt" in cfg:
@@ -135,20 +165,30 @@ class Runner:
         return valid_logging_outs
 
     def save_checkpoint_last(self, states, best_val=False):
-        cwd = os.getcwd()
+        cwd = self.exp_dir
         if best_val:
             save_path = os.path.join(cwd, "checkpoint_best.pth")
         else:
             save_path = os.path.join(cwd, "checkpoint_last.pth")
-        log.info(f"Saving checkpoint to {save_path}")
-        torch.save(states, save_path)
-        log.info(f"Saved checkpoint to {save_path}")
+        log.debug(f"Saving checkpoint to {save_path}")
+
+        def audit(path: Path) -> None:
+            saved = torch.load(path, map_location="cpu", weights_only=False)
+            if set(saved) != set(states):
+                raise ValueError(f"Checkpoint keys differ: {path.resolve()}")
+            for name, tensor in saved["model"].items():
+                if not torch.isfinite(tensor).all():
+                    raise ValueError(f"Nonfinite checkpoint parameter: {name}")
+
+        atomic_write(Path(save_path), lambda p: torch.save(states, p), audit)
+        log.debug(f"Saved checkpoint to {save_path}")
 
     def save_checkpoints(self, best_val=False):
         all_states = {}
         all_states = self.task.save_model_weights(
             self.model, all_states, self.cfg.multi_gpu
         )
+        all_states["completed_steps"] = self.completed_steps
         all_states["optim"] = self.optim.state_dict()
         all_states["scheduler"] = self.scheduler.get_state_dict()
         if self.cfg.multi_gpu:
@@ -174,6 +214,7 @@ class Runner:
                 self.device,
                 self.cfg.grad_clip,
             )
+            self.completed_steps += 1
             total_loss.append(logging_out["loss"])
             log_step = (
                 self.progress.n % self.cfg.log_step == 0
@@ -201,13 +242,23 @@ class Runner:
                     if self.cfg.checkpoint_step > -1:
                         self.save_checkpoints(best_val=True)
                         saved_best = True
+                if self.status_callback is not None:
+                    self.status_callback(
+                        "running",
+                        completed_steps=self.completed_steps,
+                        validation=valid_logging_outs,
+                        best_validation=best_val,
+                    )
             if log_step:
                 logging_out["loss"] = np.mean(total_loss)
                 self.output_logs(logging_out, valid_logging_outs)
                 total_loss = []
             if ckpt_step and not saved_best:
                 self.save_checkpoints()
-            self.progress.update(1)
+            if self.progress.disable:
+                self.progress.n += 1
+            else:
+                self.progress.update(1)
         return total_loss, (best_model, best_val)
 
     def scheduler_step(self):

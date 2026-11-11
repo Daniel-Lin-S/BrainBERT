@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from scipy import signal, stats
+from .cache import cached_stft
 
 def _first(arr, axis):
     #from https://github.com/scipy/scipy/blob/v1.9.0/scipy/stats/_stats_py.py#L2662-L2730
@@ -49,5 +50,10 @@ class STFTPreprocessor(nn.Module):
         self.cfg = cfg
 
     def forward(self, wav):
+        if self.cfg.get("feature_cache"):
+            return cached_stft(wav, self.cfg, lambda: self.extract(wav))
+        return self.extract(wav)
+
+    def extract(self, wav):
         _,_,linear = self.get_stft(wav, 2048, show_fs=self.cfg.freq_channel_cutoff, nperseg=self.cfg.nperseg, noverlap=self.cfg.noverlap, normalizing=self.cfg.normalizing, return_onesided=True) #TODO hardcode sampling rate
         return linear
