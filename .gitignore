@@ -1,0 +1,45 @@
+# Python and tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environments and build products
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Machine-specific settings and credentials
+.vscode/
+.idea/
+.codex/
+.agents/
+.env
+.env.*
+!.env.example
+*.local.*
+.DS_Store
+*~
+*.swp
+
+# Training outputs and downloaded checkpoints
+/outputs/
+/multirun/
+/logs/
+/checkpoints/
+/local_experiments/
+.hydra/
+events.out.tfevents.*
+*.pth
+*.pt
+*.ckpt
+/pretrain_data/*
+!/pretrain_data/manifests/
