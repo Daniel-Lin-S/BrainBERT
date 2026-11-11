@@ -1,24 +1,27 @@
-from omegaconf import OmegaConf
-import torch
-import random
-from torch.utils import data
 import os
+
 import numpy as np
-from scipy.io import wavfile
+import torch
+from omegaconf import OmegaConf
+from torch.utils import data
+
 from datasets import register_dataset
 from preprocessors import STFTPreprocessor
 from util.mask_utils import mask_inputs
 
 
 def prepare_example(wav, extracter, task_cfg, features=None):
-    """Apply the existing one-sample trim, STFT, and masking to one electrode."""
+    """Apply one-sample trimming, STFT, and masking to one electrode."""
     wav = wav.astype("float32")[:-1]
     data = extracter(wav) if features is None else features
-    masked_data, mask_label = mask_inputs(data, task_cfg)
+    masked_data, mask_label, provenance = mask_inputs(
+        data, task_cfg, return_provenance=True
+    )
     return {
         "masked_input": masked_data,
         "length": data.shape[0],
         "mask_label": mask_label,
+        "mask_provenance": provenance,
         "wav": wav,
         "target": data,
     }
@@ -43,6 +46,7 @@ class MaskedTFDataset(data.Dataset):
             lengths.append(row[1])
         self.files, self.lengths = files, lengths
 
+        self.preprocessor_cfg = preprocessor_cfg
         self.cached_features = None
 
         if "cached_features" in cfg:
