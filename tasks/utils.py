@@ -3,6 +3,11 @@ from torch.utils.data import Subset
 
 
 def split_dataset(dataset, args):
+    if hasattr(dataset, "partition_indices"):
+        return tuple(
+            Subset(dataset, dataset.partition_indices(name))
+            for name in ("train", "validation", "test")
+        )
     val_split = args.get("val_split", 0)
     test_split = args.get("test_split", 0)
     train_split = args.get("train_split", 1 - val_split - test_split)
