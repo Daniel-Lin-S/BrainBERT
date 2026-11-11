@@ -43,7 +43,9 @@ STFT numerical behavior is preserved. Corrupt entries fail explicitly.
 
 Invocation logs use `<log-root>/<campaign>/<invocation>/status`, `training`,
 and `errors`; checkpoints and TensorBoard data belong under the artifact root.
-Normal runs disable progress bars and TensorBoard images. Failed runs retain a
+Normal runs disable progress bars. Scientific pre-training monitors write
+compact CSV tables and TensorBoard curves under each fit's `monitoring`
+directory; see [training monitors](training_monitors.md). Failed runs retain a
 compact error record. CPU work runs at reduced priority. GPU memory fractions
 limit the PyTorch allocator, not total process or host memory.
 
