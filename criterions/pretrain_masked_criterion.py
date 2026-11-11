@@ -7,9 +7,12 @@ loss and a dictionary of scalar metrics and first-example diagnostic images.
 Empty masked or content-aware target sets raise ValueError.
 """
 
-from .base_criterion import BaseCriterion
 import torch
+
 from criterions import register_criterion
+from util.experiments.monitoring import batch_statistics
+
+from .base_criterion import BaseCriterion
 
 CONTENT_THRESHOLD = 1.0
 
@@ -69,4 +72,13 @@ class PretrainMaskedCriterion(BaseCriterion):
             "content_l1": content_l1.item(),
             "content_aware_loss": content_aware_loss.item(),
         }
+        if "mask_provenance" in batch:
+            logging_output["monitor_statistics"] = batch_statistics(
+                output,
+                labels,
+                mask,
+                pad_mask,
+                batch["mask_provenance"],
+                CONTENT_THRESHOLD,
+            )
         return loss, logging_output

@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf, open_dict
 
-from .lifecycle import FitRun, OPERATIONAL_RUNNER, scientific_config
+from .lifecycle import OPERATIONAL_RUNNER, FitRun, scientific_config
 from .storage import file_digest, write_json
 
 log = logging.getLogger(__name__)
@@ -156,10 +156,14 @@ def execute(cfg: object) -> dict:
                 metrics["peak_cuda_allocated_bytes"] = (
                     torch.cuda.max_memory_allocated()
                 )
+            if runner.monitor is not None:
+                runner.monitor.close()
             run.complete(metrics)
             return metrics
         finally:
             if runner is not None:
                 runner.progress.close()
+                if runner.monitor is not None:
+                    runner.monitor.close()
                 if runner.logger is not None:
                     runner.logger.close()

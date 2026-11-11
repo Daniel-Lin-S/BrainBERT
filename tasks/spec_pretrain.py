@@ -1,12 +1,14 @@
 # python3 run_train.py +exp=spec2vec ++exp.runner.device=cuda ++exp.runner.multi_gpu=True ++exp.runner.num_workers=16 +data=masked_tf_dataset +model=debug_model +data.data=/storage/czw/self_supervised_seeg/all_day_data/manifests ++exp.runner.train_batch_size=64
-import models
 import torch
+
+import models
 from tasks import register_task
 from tasks.base_task import BaseTask
 from tasks.batch_utils import spec_collator
+from util.experiments.monitoring import Accumulator
 from util.tensorboard_utils import (
-    plot_tensorboard_spectrogram,
     plot_tensorboard_line,
+    plot_tensorboard_spectrogram,
 )
 
 
@@ -26,9 +28,12 @@ class SpecPretrain(BaseTask):
             )
         model.eval()
         all_outs = {"loss": 0, "content_aware_loss": 0, "l1_loss": 0}
+        monitor = Accumulator()
         with torch.no_grad():
             for batch in valid_loader:
                 _, valid_outs = criterion(model, batch, device)
+                if "monitor_statistics" in valid_outs:
+                    monitor.add(valid_outs)
                 all_outs["loss"] += valid_outs["loss"]
                 all_outs["content_aware_loss"] += valid_outs[
                     "content_aware_loss"
@@ -36,6 +41,12 @@ class SpecPretrain(BaseTask):
                 all_outs["l1_loss"] += valid_outs["l1_loss"]
         for key in all_outs:
             all_outs[key] /= len(valid_loader)
+        if monitor.batches:
+            if monitor.batches != len(valid_loader):
+                raise ValueError(
+                    "Evaluation has inconsistent mask provenance."
+                )
+            all_outs["monitor_accumulator"] = monitor
         return all_outs
 
     def build_model(self, cfg):

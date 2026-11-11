@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from omegaconf import OmegaConf
+
 from .storage import digest, file_digest, write_json
 
 SCIENTIFIC_RUNNER = {
@@ -140,7 +141,10 @@ class FitRun:
                 "checkpoints/checkpoint_best.pth",
                 "checkpoints/checkpoint_last.pth",
             }
-            if set(record["artifacts"]) != required:
+            additional = set(record["artifacts"]) - required
+            if not required.issubset(record["artifacts"]) or any(
+                not name.startswith("monitoring/") for name in additional
+            ):
                 raise ValueError("Completion record has missing artifacts.")
             if (
                 json.loads((self.path / "scientific.json").read_text())
@@ -148,6 +152,9 @@ class FitRun:
             ):
                 raise ValueError("Completed scientific configuration differs.")
             for name, expected in record["artifacts"].items():
+                candidate = (self.path / name).resolve()
+                if not candidate.is_relative_to(self.path.resolve()):
+                    raise ValueError("Completion artifact escapes fit root.")
                 if file_digest(self.path / name) != expected:
                     raise ValueError(
                         f"Completed artifact checksum failed: {name}"
@@ -191,6 +198,13 @@ class FitRun:
             "checkpoints/checkpoint_last.pth",
             "scientific.json",
         ]
+        monitor_root = self.path / "monitoring"
+        if monitor_root.exists():
+            names.extend(
+                str(path.relative_to(self.path))
+                for path in sorted(monitor_root.rglob("*"))
+                if path.is_file()
+            )
         checksums = {name: file_digest(self.path / name) for name in names}
         write_json(self.path / "results.json", metrics)
         checksums["results.json"] = file_digest(self.path / "results.json")

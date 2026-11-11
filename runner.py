@@ -8,17 +8,20 @@ loss. A negative checkpoint interval disables disk saves, not model selection.
 """
 
 import copy
-from pathlib import Path
-from util.experiments.storage import atomic_write
-from tqdm.contrib.logging import logging_redirect_tqdm
-import numpy as np
-import os
-from tqdm import tqdm
-import torch
 import logging
-from tensorboardX import SummaryWriter
-from schedulers import build_scheduler
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
 import torch_optimizer as torch_optim
+from tensorboardX import SummaryWriter
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+from schedulers import build_scheduler
+from util.experiments.monitoring import Accumulator, TrainingMonitor
+from util.experiments.storage import atomic_write
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +60,9 @@ class Runner:
             torch.cuda.reset_peak_memory_stats()
         self.output_tb = cfg.get("output_tb", True)
         self.logger = None
-        if self.output_tb:
+        self.monitor = None
+        self.best_step = None
+        if self.output_tb and task.cfg.name != "spec_pretrain":
             self.logger = SummaryWriter(
                 str(Path(self.exp_dir) / "tensorboard")
             )
@@ -79,6 +84,24 @@ class Runner:
 
         if "start_from_ckpt" in cfg:
             self.load_from_ckpt()
+
+        if task.cfg.name == "spec_pretrain":
+            from criterions.pretrain_masked_criterion import CONTENT_THRESHOLD
+            from preprocessors import STFTPreprocessor
+
+            extractor = getattr(task.dataset, "extracter", None)
+            if extractor is None:
+                extractor = STFTPreprocessor(task.dataset.preprocessor_cfg)
+            base = Path(self.exp_dir)
+            root = base.parent if base.name == "checkpoints" else base
+            self.monitor = TrainingMonitor(
+                root / "monitoring",
+                extractor.frequency_axis(),
+                criterion.cfg.alpha,
+                CONTENT_THRESHOLD,
+                optimizer_groups=len(self.optim.param_groups),
+                tensorboard=self.output_tb,
+            )
 
     def load_from_ckpt(self):
         ckpt_path = self.cfg.start_from_ckpt
@@ -205,6 +228,7 @@ class Runner:
             if self.progress.n >= self.progress.total:
                 break
             self.model.train()
+            learning_rates = [group["lr"] for group in self.optim.param_groups]
             logging_out = self.task.train_step(
                 batch,
                 self.model,
@@ -215,6 +239,8 @@ class Runner:
                 self.cfg.grad_clip,
             )
             self.completed_steps += 1
+            if self.monitor is not None:
+                self.monitor.train.add(logging_out, self.cfg.grad_clip)
             total_loss.append(logging_out["loss"])
             log_step = (
                 self.progress.n % self.cfg.log_step == 0
@@ -233,10 +259,19 @@ class Runner:
             if ckpt_step or log_step:
                 self.model.eval()
                 valid_logging_outs = self.get_valid_outs()
+                if self.monitor is not None:
+                    stats = valid_logging_outs.pop("monitor_accumulator")
+                    self.monitor.record(
+                        "validation",
+                        self.completed_steps,
+                        stats,
+                        checkpoint_step=self.completed_steps,
+                    )
                 val_loss = valid_logging_outs["loss"]
                 if not np.isfinite(val_loss):
                     raise ValueError("Validation loss must be finite.")
                 if val_loss < best_val["loss"]:
+                    self.best_step = self.completed_steps
                     best_val = valid_logging_outs.copy()
                     best_model = copy.deepcopy(self.model)
                     if self.cfg.checkpoint_step > -1:
@@ -250,6 +285,14 @@ class Runner:
                         best_validation=best_val,
                     )
             if log_step:
+                if self.monitor is not None:
+                    self.monitor.record(
+                        "train",
+                        self.completed_steps,
+                        self.monitor.train,
+                        learning_rates=learning_rates,
+                    )
+                    self.monitor.train = Accumulator()
                 logging_out["loss"] = np.mean(total_loss)
                 self.output_logs(logging_out, valid_logging_outs)
                 total_loss = []
@@ -322,6 +365,13 @@ class Runner:
         test_outs = self.task.get_valid_outs(
             best_model, test_loader, self.criterion, self.device
         )
+        if self.monitor is not None:
+            self.monitor.record(
+                "test",
+                self.completed_steps,
+                test_outs.pop("monitor_accumulator"),
+                checkpoint_step=self.best_step,
+            )
         log.info(f"test_results {test_outs}")
         return test_outs
 

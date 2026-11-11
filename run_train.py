@@ -29,6 +29,8 @@ def main(cfg: DictConfig) -> None:
         runner.test(best_model)
     finally:
         runner.progress.close()
+        if runner.monitor is not None:
+            runner.monitor.close()
         if runner.logger is not None:
             runner.logger.close()
 
