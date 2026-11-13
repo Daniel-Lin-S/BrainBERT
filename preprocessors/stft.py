@@ -65,19 +65,92 @@ class STFTPreprocessor(nn.Module):
             : self.cfg.freq_channel_cutoff
         ]
 
-    def forward(self, wav):
-        if self.cfg.get("feature_cache"):
-            return cached_stft(wav, self.cfg, lambda: self.extract(wav))
-        return self.extract(wav)
+    def unnormalized(self, wav: np.ndarray) -> torch.Tensor:
+        """Return magnitude STFT (frames, frequencies) after edge trimming.
 
-    def extract(self, wav):
+        Parameters
+        ----------
+        wav : numpy.ndarray
+            One electrode's waveform, shape (samples,).
+
+        Returns
+        -------
+        torch.Tensor
+            Finite float32 magnitude spectrum, shape (frames, frequencies).
+        """
         _, _, linear = self.get_stft(
             wav,
             SAMPLE_RATE_HZ,
             show_fs=self.cfg.freq_channel_cutoff,
             nperseg=self.cfg.nperseg,
             noverlap=self.cfg.noverlap,
-            normalizing=self.cfg.normalizing,
+            normalizing=None,
+            return_onesided=True,
+        )
+        if linear.shape[0] <= 20 or not torch.isfinite(linear).all():
+            raise ValueError("STFT needs more than 20 finite time frames.")
+        return linear[10:-10]
+
+    def forward(self, wav: np.ndarray, statistics: dict | None = None):
+        mode = self.cfg.normalizing
+        if (
+            mode in {"recording_zscore", "dataset_zscore"}
+            and statistics is None
+        ):
+            raise ValueError(
+                "STFT normalization requires fitted frequency statistics "
+                "from a dataset with explicit training membership."
+            )
+        identity = statistics["identity"] if statistics is not None else None
+        if self.cfg.get("feature_cache"):
+            return cached_stft(
+                wav,
+                self.cfg,
+                lambda: self.extract(wav, statistics),
+                normalization_identity=identity,
+            )
+        return self.extract(wav, statistics)
+
+    def extract(self, wav: np.ndarray, statistics: dict | None = None):
+        """Normalize one (frames, frequencies) STFT with explicit mode."""
+        mode = self.cfg.normalizing
+        if mode in {"recording_zscore", "dataset_zscore"}:
+            if statistics is None:
+                raise ValueError(
+                    "STFT requires explicit fitted frequency statistics."
+                )
+            spectrum = self.unnormalized(wav)
+            means = np.asarray(statistics["mean"], dtype=np.float64)
+            stds = np.asarray(statistics["std"], dtype=np.float64)
+            if means.shape != spectrum.shape[1:] or stds.shape != means.shape:
+                raise ValueError(
+                    "Recording statistics must have one mean and standard "
+                    "deviation per STFT frequency."
+                )
+            if (
+                not np.isfinite(means).all()
+                or not np.isfinite(stds).all()
+                or np.any(stds <= 0)
+            ):
+                raise ValueError(
+                    "Recording STFT statistics must be finite and "
+                    "have positive standard deviations."
+                )
+            output = (spectrum.double().numpy() - means) / stds
+            if not np.isfinite(output).all():
+                raise ValueError("Normalized recording STFT is not finite.")
+            return torch.from_numpy(output.astype(np.float32))
+        if mode not in {"zscore", "window_zscore", "db"}:
+            raise ValueError(
+                f"Unknown STFT normalization: {self.cfg.normalizing!r}"
+            )
+        _, _, linear = self.get_stft(
+            wav,
+            SAMPLE_RATE_HZ,
+            show_fs=self.cfg.freq_channel_cutoff,
+            nperseg=self.cfg.nperseg,
+            noverlap=self.cfg.noverlap,
+            normalizing="zscore" if mode == "window_zscore" else mode,
             return_onesided=True,
         )  # TODO hardcode sampling rate
         return linear

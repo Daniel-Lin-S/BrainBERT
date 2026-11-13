@@ -4,5 +4,5 @@ spec_name: stft
 freq_channel_cutoff: 40
 nperseg: 400
 noverlap: 350
-normalizing: zscore
+normalizing: recording_zscore
 upstream_ckpt: /storage/czw/self_supervised_seeg/outputs/2022-07-19/17-25-17/checkpoint_last.pth #trained on all subject3 electrodes

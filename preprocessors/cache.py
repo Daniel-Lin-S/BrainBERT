@@ -12,13 +12,17 @@ from typing import Callable
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+
 from util.experiments.storage import atomic_write, digest
 
 STFT_CACHE_REVISION = "brainbert-stft-v1"
 
 
 def cached_stft(
-    wav: np.ndarray, cfg: object, extract: Callable
+    wav: np.ndarray,
+    cfg: object,
+    extract: Callable,
+    normalization_identity: str | None = None,
 ) -> torch.Tensor:
     """Read or atomically produce a finite (frames, frequencies) STFT tensor."""
     settings = OmegaConf.to_container(cfg, resolve=True)
@@ -28,15 +32,16 @@ def cached_stft(
         raise ValueError(
             "STFT caching requires a finite, nonempty 1D waveform."
         )
-    key = digest(
-        {
-            "revision": STFT_CACHE_REVISION,
-            "settings": settings,
-            "waveform": hashlib.sha256(raw.tobytes()).hexdigest(),
-            "dtype": str(raw.dtype),
-            "shape": list(raw.shape),
-        }
-    )
+    key_data = {
+        "revision": STFT_CACHE_REVISION,
+        "settings": settings,
+        "waveform": hashlib.sha256(raw.tobytes()).hexdigest(),
+        "dtype": str(raw.dtype),
+        "shape": list(raw.shape),
+    }
+    if normalization_identity is not None:
+        key_data["normalization_identity"] = normalization_identity
+    key = digest(key_data)
     path = root / "stft" / key[:2] / f"{key}.npy"
 
     def audit(candidate: Path) -> None:

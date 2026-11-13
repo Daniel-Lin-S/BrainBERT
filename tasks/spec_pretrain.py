@@ -53,7 +53,23 @@ class SpecPretrain(BaseTask):
         assert hasattr(self, "dataset")
         input_dim = self.dataset.get_input_dim()
         assert input_dim == cfg.input_dim
-        return models.build_model(cfg)
+        model = models.build_model(cfg)
+        extractor = getattr(self.dataset, "extracter", None)
+        if (
+            extractor is not None
+            and extractor.cfg.normalizing == "dataset_zscore"
+        ):
+            if not hasattr(self.dataset, "prepare_statistics"):
+                raise ValueError(
+                    "Dataset-level STFT requires explicit training-electrode "
+                    "membership and a statistics adapter."
+                )
+            if not hasattr(model, "set_stft_statistics"):
+                raise ValueError(
+                    "Model cannot persist fitted STFT statistics."
+                )
+            model.set_stft_statistics(self.dataset.prepare_statistics())
+        return model
 
     def get_batch_iterator(self, dataset, batch_size, shuffle=True, **kwargs):
         return super().get_batch_iterator(

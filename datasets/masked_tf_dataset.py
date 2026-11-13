@@ -10,10 +10,18 @@ from preprocessors import STFTPreprocessor
 from util.mask_utils import mask_inputs
 
 
-def prepare_example(wav, extracter, task_cfg, features=None):
+def prepare_example(
+    wav,
+    extracter,
+    task_cfg,
+    features=None,
+    statistics=None,
+):
     """Apply one-sample trimming, STFT, and masking to one electrode."""
     wav = wav.astype("float32")[:-1]
-    data = extracter(wav) if features is None else features
+    data = (
+        extracter(wav, statistics=statistics) if features is None else features
+    )
     masked_data, mask_label, provenance = mask_inputs(
         data, task_cfg, return_provenance=True
     )
@@ -50,6 +58,13 @@ class MaskedTFDataset(data.Dataset):
         self.cached_features = None
 
         if "cached_features" in cfg:
+            if preprocessor_cfg.normalizing in {
+                "recording_zscore", "dataset_zscore"
+            }:
+                raise ValueError(
+                    "Fitted STFT normalization cannot use cached features "
+                    "without recording/electrode normalization metadata."
+                )
             self.cached_features = cfg.cached_features
             self.initialize_cached_features(cfg.cached_features)
         elif preprocessor_cfg.name == "stft":

@@ -5,7 +5,9 @@ five-second spans. Released notch filtering and group-median referencing are
 preserved. Metadata uses ElectricalSeries electrode-table mappings.
 """
 
+from contextlib import nullcontext
 from pathlib import Path
+
 import h5py
 import numpy as np
 from scipy.signal import resample_poly
@@ -22,7 +24,7 @@ REASONS = {"bad_electrode": 1, "blocklist": 2, "nonfinite": 4, "constant": 8}
 
 
 def metadata(path: Path) -> dict:
-    """Read recording, mapped electrode, and interval metadata without signals."""
+    """Read recording, mapped electrode, and interval metadata."""
     with h5py.File(path, "r") as f:
         s = f["acquisition/ElectricalSeries"]
         rate = float(s["starting_time"].attrs["rate"])
@@ -86,7 +88,12 @@ def annotations(meta: dict) -> tuple:
 
 
 def waveform(
-    path: Path, meta: dict, index: int, channel: int, valid: np.ndarray
+    path: Path,
+    meta: dict,
+    index: int,
+    channel: int,
+    valid: np.ndarray,
+    source: h5py.File | None = None,
 ) -> np.ndarray:
     """Resample one electrode with context confined to its valid window run.
 
@@ -102,7 +109,8 @@ def waveform(
     stop = start + WINDOW
     left = HALO if index > 0 and valid[index - 1, channel] else 0
     right = HALO if index + 1 < len(valid) and valid[index + 1, channel] else 0
-    with h5py.File(path, "r") as f:
+    context = h5py.File(path, "r") if source is None else nullcontext(source)
+    with context as f:
         values = f["acquisition/ElectricalSeries/data"][
             start - left : stop + right, channel
         ].astype(np.float64)

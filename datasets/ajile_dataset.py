@@ -6,15 +6,22 @@ batch dictionary. No model input contains a channel axis. Source placement
 and audit paths are local settings, not scientific identity.
 """
 
-from bisect import bisect_right
 import json
+from bisect import bisect_right
 from pathlib import Path
+
 import numpy as np
 from torch.utils.data import Dataset
+
+from data.ajile.core import POLICY, waveform
+from data.ajile.normalization import (
+    dataset_statistics,
+    eligibility,
+    recording_statistics,
+)
 from datasets import register_dataset
 from datasets.masked_tf_dataset import prepare_example
 from preprocessors import STFTPreprocessor
-from data.ajile.core import POLICY, waveform
 
 
 class SessionIndices:
@@ -39,7 +46,7 @@ class SessionIndices:
 
 @register_dataset(name="ajile12")
 class AJILE12(Dataset):
-    """Load one eligible electrode/window without materializing waveform files."""
+    """Load an eligible electrode window without materializing waveforms."""
 
     def __init__(
         self,
@@ -68,6 +75,14 @@ class AJILE12(Dataset):
         self.active = None
         self.valid = None
         self.positions = None
+        self.statistics = None
+        self.dataset_statistics = None
+        self.key_to_index = None
+        self.session_partition = {
+            session: name
+            for name, sessions in self.partitions.items()
+            for session in sessions
+        }
         assigned = sum(self.partitions.values(), [])
         if len(assigned) != len(set(assigned)) or set(assigned) != {
             r["session"] for r in self.records
@@ -106,11 +121,27 @@ class AJILE12(Dataset):
             )
         return result
 
+    def prepare_statistics(self) -> dict:
+        """Fit electrode/frequency moments on training recordings only."""
+        if self.extracter.cfg.normalizing != "dataset_zscore":
+            raise ValueError("Expected dataset_zscore for shared statistics.")
+        if self.dataset_statistics is None:
+            training = set(self.partitions["train"])
+            records = [r for r in self.records if r["session"] in training]
+            self.dataset_statistics = dataset_statistics(
+                Path(self.root_dir), self.audit, records, self.extracter
+            )
+            self.key_to_index = {
+                key: index
+                for index, key in enumerate(self.dataset_statistics["keys"])
+            }
+        return self.dataset_statistics
+
     def get_input_dim(self) -> int:
         return self.extracter.cfg.freq_channel_cutoff
 
     def verify_test(self, path: Path) -> None:
-        """Verify pinned sessions and their complete source-content identities."""
+        """Verify pinned sessions and their source identities."""
         expected = {
             "sessions": self.partitions["test"],
             "content_ids": {
@@ -128,18 +159,19 @@ class AJILE12(Dataset):
         session = bisect_right(self.ends, index)
         record = self.records[session]
         if self.active != session:
-            blocks = []
-            for path in sorted(
-                (self.audit / "sessions" / record["session"] / "blocks").glob(
-                    "*.npz"
-                )
-            ):
-                with np.load(path, allow_pickle=False) as saved:
-                    blocks.append(saved["reasons"])
-            self.valid = np.concatenate(blocks) == 0
+            self.valid = eligibility(self.audit, record)
             self.positions = np.flatnonzero(self.valid)
             if len(self.positions) != record["eligible"]:
                 raise ValueError("AJILE eligibility index count differs.")
+            self.statistics = None
+            if self.extracter.cfg.normalizing == "recording_zscore":
+                self.statistics = recording_statistics(
+                    Path(self.root_dir),
+                    record,
+                    self.session_partition[record["session"]],
+                    self.valid,
+                    self.extracter,
+                )
             self.active = session
         local = index - (self.ends[session - 1] if session else 0)
         window, channel = divmod(
@@ -152,4 +184,32 @@ class AJILE12(Dataset):
             channel,
             self.valid,
         )
-        return prepare_example(wav, self.extracter, self.task_cfg)
+        statistics = None
+        if self.extracter.cfg.normalizing == "dataset_zscore":
+            shared = self.prepare_statistics()
+            label = json.dumps(
+                [record["subject"], record["metadata"]["ids"][channel]],
+                separators=(",", ":"),
+            )
+            if label not in self.key_to_index:
+                raise ValueError(
+                    "Evaluation electrode has no training STFT statistics: "
+                    f"{label}"
+                )
+            row = self.key_to_index[label]
+            statistics = {
+                "mean": shared["mean"][row],
+                "std": shared["std"][row],
+                "identity": f"{shared['identity']}:electrode:{label}",
+            }
+        elif self.statistics is not None:
+            statistics = {
+                "mean": self.statistics["mean"][channel],
+                "std": self.statistics["std"][channel],
+                "identity": (
+                    f"{self.statistics['identity']}:electrode:{channel}"
+                ),
+            }
+        return prepare_example(
+            wav, self.extracter, self.task_cfg, statistics=statistics
+        )
