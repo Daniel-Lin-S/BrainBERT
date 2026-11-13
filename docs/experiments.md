@@ -39,7 +39,11 @@ split or data selection is created automatically.
 
 STFT caching stores finite unmasked tensors beneath the configured cache root,
 keyed by waveform content, preprocessing settings and cache revision. Existing
-STFT numerical behavior is preserved. Corrupt entries fail explicitly.
+STFT preprocessing defaults to per-electrode, per-frequency recording-wise
+z-scoring. Explicit `normalizing: window_zscore` retains the older window
+behavior. Source recordings need explicit electrode and recording identities;
+missing identities fail clearly. The normalization mode is a scientific fit
+parameter and changes the fit hash. Corrupt cache entries fail explicitly.
 
 Invocation logs use `<log-root>/<campaign>/<invocation>/status`, `training`,
 and `errors`; checkpoints and TensorBoard data belong under the artifact root.
@@ -55,3 +59,10 @@ counts. Group corpus totals, per-subject counts, current-recording duration,
 and training-example counts separately. Each example count specifies its
 unit and window duration. Remaining counts include active work. Apply this
 convention to future audits as well.
+
+Set `preprocessor.normalizing: dataset_zscore` to pool unmasked STFT frames
+across all training recordings for each subject/electrode/frequency. The
+fitted moments are stored as model buffers and used for training, validation
+and test. Validation/test windows never contribute to fitting. Electrode IDs
+must be present in training; missing IDs fail explicitly. The standard STFT
+configuration continues to default to recording-wise normalization.

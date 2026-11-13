@@ -35,3 +35,32 @@ corpus. Source size and modification time guard reuse of a completed scan;
 content identity includes metadata and hashes of all decoded source blocks.
 No spectrogram corpus is generated during scanning. Existing feature caching
 is used lazily by training.
+
+AJILE STFT normalization uses one mean and population standard deviation per
+frequency and electrode, fitted across eligible windows in that recording's
+assigned split. Training recordings use only training windows. Validation and
+test recordings use their own unlabeled split windows; current splits assign
+whole sessions, so no session contributes to more than one split. Excluded
+windows never contribute. The five-second waveform trim and STFT edge trim
+match the features supplied to the model.
+
+The recording-statistics cache lives under the configured feature cache root,
+with a resumable per-electrode partial and one complete table per session.
+It stores only moments and frame counts, not spectrograms. Preparation can be
+run separately with `python -m data.ajile.normalization --source-root ...
+--audit ... --feature-cache ... --preprocessor ...`; pass the local dataset,
+audit and cache roots and the STFT YAML. Training also prepares a missing
+recording cache lazily, which may delay its first batch. The full AJILE pass
+covers tens of millions of electrode windows and should be run detached under
+the normal CPU priority and memory limits before a large training campaign.
+
+The optional `dataset_zscore` mode pools eligible training windows across
+recordings with the same subject and electrode ID. It fits one mean and
+standard deviation per frequency for each electrode. Validation and test
+recordings use these training moments, and contribute no frames. A held-out
+electrode without training statistics raises an error. The pooled cache is
+keyed by the complete training-recording list and STFT settings. The fitted
+arrays and electrode identities are also persistent buffers in the model
+checkpoint; `normalize_stft` can apply a checkpoint's moments to an unmasked
+STFT at inference. Prepare this mode with the normalization command above
+and `--normalizing dataset_zscore`.
