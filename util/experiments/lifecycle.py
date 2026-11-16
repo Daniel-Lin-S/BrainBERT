@@ -192,23 +192,20 @@ class FitRun:
         """Replace the compact status document for this invocation."""
         path = self.logs / "status" / "status.json"
         previous = json.loads(path.read_text()) if path.exists() else {}
-        if previous.get("phase") != phase:
-            keep = {
-                "completed_steps", "total_steps", "epoch",
-                "completed_epochs", "total_epochs",
-                "validation", "best_validation",
-            }
-            previous = {
-                key: value for key, value in previous.items()
-                if key in keep
-            }
-        previous.update(details)
-        previous.update({
-            "fit_id": self.fit_id,
-            "phase": phase,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        })
-        write_json(path, previous)
+        stages = previous.get("stages", {})
+        if details:
+            stage = stages.get(phase, {})
+            stage.update(details)
+            stages[phase] = stage
+        write_json(
+            path,
+            {
+                "fit_id": self.fit_id,
+                "phase": phase,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "stages": stages,
+            },
+        )
 
     def complete(self, metrics: dict) -> None:
         """Commit metrics and checkpoint checksums before completion."""

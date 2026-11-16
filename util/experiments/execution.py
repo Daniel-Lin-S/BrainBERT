@@ -268,20 +268,26 @@ def execute(cfg: object) -> dict:
                             "verify selected STFT caches and load or fit "
                             "normalization moments"
                         ),
-                        completed_steps=0,
-                        total_steps=cfg.exp.runner.total_steps,
-                        epoch=0,
-                        total_epochs=cfg.exp.runner.get("epochs"),
                     )
 
                 task.dataset.prepare_selected(
                     task.dataset.selection_manifest,
                     progress_callback=report_preparation,
                 )
+            run.status(
+                "model_initialization",
+                detail="build model, optimizer, and monitoring writers",
+            )
             model = task.build_model(cfg.model)
             criterion = task.build_criterion(cfg.criterion)
             runner = Runner(cfg.exp.runner, task, model, criterion)
             runner.status_callback = run.status
+            run.status(
+                "training", completed_steps=0,
+                total_steps=cfg.exp.runner.total_steps,
+                epoch=0, completed_epochs=0,
+                total_epochs=cfg.exp.runner.get("epochs"),
+            )
             best = runner.train()
             metrics = runner.test(best)
             if str(cfg.exp.runner.device).startswith("cuda"):

@@ -35,6 +35,31 @@ from util.mask_utils import fixed_mask_inputs, mask_inputs, variable_mask
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_status_groups_progress_by_stage(tmp_path):
+    """Keep preparation, training, and evaluation counts distinct."""
+    run = object.__new__(FitRun)
+    run.fit_id = "status-smoke"
+    run.logs = tmp_path
+    (tmp_path / "status").mkdir()
+    run.status(
+        "fit_preparation", completed_sessions=2, total_sessions=3
+    )
+    run.status(
+        "training", completed_steps=10, total_steps=20,
+        completed_epochs=0, total_epochs=2,
+    )
+    run.status("validation", completed_batches=4, total_batches=8)
+    status = json.loads((tmp_path / "status/status.json").read_text())
+    assert status["phase"] == "validation"
+    assert status["stages"]["fit_preparation"] == {
+        "completed_sessions": 2, "total_sessions": 3,
+    }
+    assert status["stages"]["training"]["completed_steps"] == 10
+    assert status["stages"]["validation"] == {
+        "completed_batches": 4, "total_batches": 8,
+    }
+
+
 def sample_stats(repeats=1):
     """Make nine known groups with one absent content-aware subset."""
     target = torch.tensor([2.0, 0.5, -2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])

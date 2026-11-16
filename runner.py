@@ -188,28 +188,29 @@ class Runner:
         """Persist optimizer and current stage progress for managed fits."""
         if self.status_callback is None:
             return
-        self.status_callback(
-            phase,
-            completed_steps=self.completed_steps,
-            total_steps=self.cfg.total_steps,
-            epoch=getattr(self, "epoch_index", 0),
-            total_epochs=self.cfg.get("epochs"),
-            completed_epochs=(
-                min(
-                    self.completed_steps // self.steps_per_epoch,
-                    self.cfg.epochs,
-                )
-                if self.cfg.get("epochs") is not None
-                and hasattr(self, "steps_per_epoch") else None
-            ),
-            **(
-                {}
-                if phase == "training" else {
-                    "completed_batches": completed,
-                    "total_batches": total,
-                }
-            ),
+        epoch = getattr(self, "epoch_index", 0)
+        completed_epochs = (
+            min(self.completed_steps // self.steps_per_epoch, self.cfg.epochs)
+            if self.cfg.get("epochs") is not None
+            and hasattr(self, "steps_per_epoch") else None
         )
+        details = {
+            "epoch": epoch,
+            "completed_epochs": completed_epochs,
+            "total_epochs": self.cfg.get("epochs"),
+        }
+        if phase == "training":
+            details.update(
+                completed_steps=self.completed_steps,
+                total_steps=self.cfg.total_steps,
+            )
+        else:
+            details.update(
+                at_optimizer_step=self.completed_steps,
+                completed_batches=completed,
+                total_batches=total,
+            )
+        self.status_callback(phase, **details)
 
     def get_valid_outs(self):
         valid_loader = self.get_batch_iterator(
