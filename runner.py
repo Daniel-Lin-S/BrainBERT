@@ -146,6 +146,11 @@ class Runner:
                 optimizer_groups=len(self.optim.param_groups),
                 normalization_mode=extractor.cfg.normalizing,
                 tensorboard=self.output_tb,
+                tensorboard_root=root / "monitoring/tensorboard",
+                purge_step=(
+                    self.completed_steps + 1
+                    if cfg.get("resume_from_ckpt") is not None else None
+                ),
             )
 
     def load_from_ckpt(self, ckpt_path):

@@ -15,6 +15,11 @@ its own moments from eligible windows in its assigned split, so one
 normalized unit can represent a different raw magnitude across
 recordings. The monitor metadata identifies the normalization mode.
 
+TensorBoard uses the fit's single `monitoring/tensorboard` run across
+restarts. Checkpoint restoration continues its step axis and hides events
+from updates beyond the restored checkpoint. CSV invocation segments retain
+previous records without overwriting them.
+
 ## Epoch summaries and representation diversity
 
 `epoch_metrics.csv`, `epoch_mask_groups.csv`, and

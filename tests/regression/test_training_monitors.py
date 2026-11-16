@@ -97,6 +97,38 @@ def test_cuda_rng_restoration_rejects_empty_checkpoint():
         restore_cuda_rng([])
 
 
+def test_tensorboard_resume_is_one_run_with_rollback(tmp_path):
+    """Resume joins validation history and replaces unsaved training points."""
+    shared = tmp_path / "tensorboard"
+    first = TrainingMonitor(
+        tmp_path / "initial", np.arange(4.0), 2.0, 0.1, 1,
+        "recording_zscore", tensorboard_root=shared,
+    )
+    first.writer.add_scalar("validation/overall/total_loss", 3.0, 1)
+    first.writer.add_scalar("train/overall/total_loss", 4.0, 1)
+    first.writer.add_scalar("train/overall/total_loss", 9.0, 101)
+    first.close()
+    resumed = TrainingMonitor(
+        tmp_path / "resumed", np.arange(4.0), 2.0, 0.1, 1,
+        "recording_zscore", tensorboard_root=shared, purge_step=2,
+    )
+    resumed.writer.add_scalar("train/overall/total_loss", 2.0, 101)
+    resumed.writer.add_scalar("validation/overall/total_loss", 1.0, 1001)
+    resumed.close()
+    events = EventAccumulator(str(shared))
+    events.Reload()
+    validation = events.Scalars("validation/overall/total_loss")
+    training = events.Scalars("train/overall/total_loss")
+    assert [event.step for event in validation] == [1, 1001]
+    assert [(event.step, event.value) for event in training] == [
+        (1, 4.0), (101, 2.0),
+    ]
+    parents = {
+        path.parent for path in tmp_path.rglob("events.out.tfevents.*")
+    }
+    assert parents == {shared}
+
+
 def test_status_groups_progress_by_stage(tmp_path):
     """Keep preparation, training, and evaluation counts distinct."""
     run = object.__new__(FitRun)

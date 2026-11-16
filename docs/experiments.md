@@ -44,8 +44,9 @@ best checkpoints and an unshuffled training order resumes its model,
 optimizer, scheduler, and step count;
 invalid or uncheckpointed attempts are quarantined. Only the latest and best
 checkpoints are retained, so an interruption can lose updates since the most
-recent checkpoint. Resumed monitoring writes a new segment without replacing
-previous monitor records.
+recent checkpoint. CSV monitoring preserves separate invocation segments.
+TensorBoard uses one shared event directory per fit across all resumes,
+connecting the saved history and hiding unsaved updates after rollback.
 Checkpoint replacement stages, backs up, audits, and atomically installs the
 new file before removing the backup. Only best and last checkpoints are kept.
 

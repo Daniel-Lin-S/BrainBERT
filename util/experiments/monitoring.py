@@ -12,8 +12,9 @@ records normalization and categorical semantics; no spectrograms are saved.
 
 import csv
 import gzip
-import warnings
 import os
+import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -314,6 +315,8 @@ class TrainingMonitor:
         optimizer_groups: int,
         normalization_mode: str,
         tensorboard: bool = True,
+        tensorboard_root: Path | None = None,
+        purge_step: int | None = None,
     ) -> None:
         """Create writers; tensorboard is optional and defaults to True.
 
@@ -331,6 +334,10 @@ class TrainingMonitor:
             STFT normalization applied by the shared source dataset.
         tensorboard : bool, optional
             Enable event output, default True; CSV is always written.
+        tensorboard_root : Path or None, optional
+            Shared event directory across resumes; default root/tensorboard.
+        purge_step : int or None, optional
+            First unsaved update to hide after recovery, default None.
         """
         self.root = root.resolve()
         self.frequencies = np.asarray(frequencies, dtype=float)
@@ -393,7 +400,14 @@ class TrainingMonitor:
             },
         )
         if tensorboard:
-            self.writer = SummaryWriter(str(self.root / "tensorboard"))
+            event_root = (
+                self.root / "tensorboard"
+                if tensorboard_root is None else tensorboard_root.resolve()
+            )
+            self.writer = SummaryWriter(
+                str(event_root), purge_step=purge_step,
+                filename_suffix=f".{time.time_ns()}.{os.getpid()}",
+            )
 
     def _row(self, table: str, row: dict, tag: str | None = None) -> None:
         """Append a row and mirror numeric measurements to TensorBoard."""
