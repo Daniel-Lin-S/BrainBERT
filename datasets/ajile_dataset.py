@@ -61,6 +61,7 @@ class AJILE12(Dataset):
 
     selection_namespace = SELECTION_NAMESPACE
     selection_revision = SELECTION_REVISION
+    raw_stft_namespace = RAW_STFT_NAMESPACE
 
     def __init__(
         self,

@@ -265,8 +265,8 @@ def execute(cfg: object) -> dict:
                         completed_sessions=completed,
                         total_sessions=total,
                         detail=(
-                            "verify selected STFT caches and load or fit "
-                            "normalization moments"
+                            "check selected STFT cache membership, audit "
+                            "sample contents, and load or fit moments"
                         ),
                     )
 

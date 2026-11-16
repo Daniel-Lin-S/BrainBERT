@@ -18,6 +18,7 @@ DEFAULT_SEED = 0
 DEFAULT_EVAL_BATCHES = 128
 DEFAULT_EVAL_BATCH_SIZE = 256
 PREPROCESS_NICE = 10
+CACHE_AUDIT_WINDOWS_PER_SESSION = 2
 
 
 def select_evaluation_group(
@@ -82,6 +83,7 @@ def _prepare_session(
 ) -> tuple[str, dict]:
     """Cache selected spectra and fit moments for one session."""
     from data.ajile.normalization import eligibility
+    from preprocessors.cache import cached_raw_positions
     from util.experiments.storage import atomic_write
 
     root = Path(dataset.extracter.cfg.feature_cache).resolve()
@@ -103,7 +105,22 @@ def _prepare_session(
         with np.load(path, allow_pickle=False) as saved:
             means = saved["mean"].copy()
             stds = saved["std"].copy()
-        for index in indices:
+        offset = dataset.ends[session - 1] if session else 0
+        positions = dataset.positions[np.asarray(indices) - offset]
+        cached = cached_raw_positions(
+            root, dataset.raw_stft_namespace,
+            record["content_id"], dataset.extracter.cfg,
+        )
+        missing = [
+            index for index, position in zip(indices, positions)
+            if int(position) not in cached
+        ]
+        for index in missing:
+            dataset.raw_spectrum(index)
+        audit_indices = indices[:1] + indices[-1:]
+        for index in dict.fromkeys(
+            audit_indices[:CACHE_AUDIT_WINDOWS_PER_SESSION]
+        ):
             dataset.raw_spectrum(index)
     else:
         channels = record["metadata"]["channels"]
