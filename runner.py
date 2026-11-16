@@ -384,8 +384,6 @@ class Runner:
                             self.completed_steps // self.steps_per_epoch,
                             self.cfg.epochs,
                         ) if self.cfg.get("epochs") is not None else None,
-                        validation=valid_logging_outs,
-                        best_validation=best_val,
                     )
             if log_step:
                 logging_out["loss"] = np.mean(total_loss)

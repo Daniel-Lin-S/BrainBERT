@@ -44,6 +44,12 @@ OPERATIONAL_RUNNER = {
     "gpu_memory_fraction",
     "cpu_threads",
 }
+STATUS_FIELDS = {
+    "completed_sessions", "total_sessions", "detail",
+    "completed_steps", "total_steps", "epoch",
+    "completed_epochs", "total_epochs", "at_optimizer_step",
+    "completed_batches", "total_batches",
+}
 DATA_PLACEMENT = {
     "data",
     "cached_features",
@@ -189,7 +195,13 @@ class FitRun:
         write_json(self.reference, {"fit_id": self.fit_id})
 
     def status(self, phase: str, **details: object) -> None:
-        """Replace the compact status document for this invocation."""
+        """Replace lifecycle progress without saving model metrics."""
+        unknown = set(details) - STATUS_FIELDS
+        if unknown:
+            raise ValueError(
+                f"Lifecycle status cannot contain metric fields: "
+                f"{sorted(unknown)}"
+            )
         path = self.logs / "status" / "status.json"
         previous = json.loads(path.read_text()) if path.exists() else {}
         stages = previous.get("stages", {})

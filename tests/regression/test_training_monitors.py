@@ -58,6 +58,8 @@ def test_status_groups_progress_by_stage(tmp_path):
     assert status["stages"]["validation"] == {
         "completed_batches": 4, "total_batches": 8,
     }
+    with pytest.raises(ValueError, match="metric fields"):
+        run.status("training", validation={"loss": 1.0})
 
 
 def sample_stats(repeats=1):
@@ -356,6 +358,11 @@ def test_training_csv_tensorboard_and_best_checkpoint(
             and details["completed_batches"] == 1
             and details["total_batches"] == 1
             for phase, details in status_events
+        )
+        assert all(
+            "validation" not in details
+            and "best_validation" not in details
+            for _, details in status_events
         )
     finally:
         runner.monitor.close()
