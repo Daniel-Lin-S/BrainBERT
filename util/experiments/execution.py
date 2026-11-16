@@ -261,8 +261,13 @@ def execute(cfg: object) -> dict:
             ):
                 def report_preparation(completed, total):
                     run.status(
-                        "preprocessing", completed=completed,
-                        total=total, unit="sessions",
+                        "fit_preparation",
+                        completed_sessions=completed,
+                        total_sessions=total,
+                        detail=(
+                            "verify selected STFT caches and load or fit "
+                            "normalization moments"
+                        ),
                         completed_steps=0,
                         total_steps=cfg.exp.runner.total_steps,
                         epoch=0,

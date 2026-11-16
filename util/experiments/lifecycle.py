@@ -192,6 +192,16 @@ class FitRun:
         """Replace the compact status document for this invocation."""
         path = self.logs / "status" / "status.json"
         previous = json.loads(path.read_text()) if path.exists() else {}
+        if previous.get("phase") != phase:
+            keep = {
+                "completed_steps", "total_steps", "epoch",
+                "completed_epochs", "total_epochs",
+                "validation", "best_validation",
+            }
+            previous = {
+                key: value for key, value in previous.items()
+                if key in keep
+            }
         previous.update(details)
         previous.update({
             "fit_id": self.fit_id,

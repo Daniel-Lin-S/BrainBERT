@@ -202,9 +202,13 @@ class Runner:
                 if self.cfg.get("epochs") is not None
                 and hasattr(self, "steps_per_epoch") else None
             ),
-            completed=completed,
-            total=total,
-            unit="steps" if phase == "training" else "batches",
+            **(
+                {}
+                if phase == "training" else {
+                    "completed_batches": completed,
+                    "total_batches": total,
+                }
+            ),
         )
 
     def get_valid_outs(self):
@@ -379,9 +383,6 @@ class Runner:
                             self.completed_steps // self.steps_per_epoch,
                             self.cfg.epochs,
                         ) if self.cfg.get("epochs") is not None else None,
-                        completed=self.completed_steps,
-                        total=self.cfg.total_steps,
-                        unit="steps",
                         validation=valid_logging_outs,
                         best_validation=best_val,
                     )
