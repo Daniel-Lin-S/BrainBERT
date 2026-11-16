@@ -35,6 +35,40 @@ from util.mask_utils import fixed_mask_inputs, mask_inputs, variable_mask
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("device", ["cuda", "cuda:0"])
+def test_runner_pins_device_before_memory_limits(tmp_path, device):
+    """Per-device allocator limits must not redirect the primary replica."""
+    current = [0]
+    placements = []
+    model = torch.nn.Linear(2, 2)
+    model.to = lambda value: placements.append(value) or model
+    cfg = OmegaConf.create({
+        "device": device, "multi_gpu": True,
+        "gpu_memory_fraction": 0.2, "artifact_dir": str(tmp_path),
+        "output_tb": False, "quiet": True, "optim": "SGD", "lr": 0.001,
+        "total_steps": 2,
+        "scheduler": {"name": "ramp_up", "warmup": 0.5, "total_steps": 2},
+    })
+    task = SimpleNamespace(cfg=SimpleNamespace(name="device_smoke"))
+    with (
+        patch("torch.cuda.current_device", side_effect=lambda: current[0]),
+        patch("torch.cuda.device_count", return_value=4),
+        patch(
+            "torch.cuda.set_per_process_memory_fraction",
+            side_effect=lambda fraction, index: current.__setitem__(0, index),
+        ),
+        patch("torch.cuda.reset_peak_memory_stats"),
+        patch("torch.nn.DataParallel", side_effect=lambda value: value),
+    ):
+        runner = Runner(cfg, task, model, None)
+    try:
+        assert current[0] == 3
+        assert runner.device == torch.device("cuda:0")
+        assert placements == [torch.device("cuda:0")]
+    finally:
+        runner.progress.close()
+
+
 @pytest.mark.parametrize("saved,visible", [(1, 4), (4, 1), (4, 4)])
 def test_cuda_rng_restoration_across_device_counts(saved, visible):
     """Changed GPU counts keep available streams without invalid devices."""

@@ -69,7 +69,9 @@ class Runner:
         self.evaluator = None
         self.status_callback = None
         self.completed_steps = 0
-        self.device = cfg.device
+        self.device = torch.device(cfg.device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.criterion = criterion
         self.exp_dir = str(
             Path(cfg.get("artifact_dir", os.getcwd())).resolve()
