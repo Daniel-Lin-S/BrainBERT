@@ -301,6 +301,10 @@ def test_training_csv_tensorboard_and_best_checkpoint(
         }
     )
     runner = Runner(cfg, task, TinyModel(), criterion)
+    status_events = []
+    runner.status_callback = lambda phase, **details: status_events.append(
+        (phase, details)
+    )
     if checkpoint_step != log_step:
         shared_validation = task.valid_set
         task.valid_set = [example()]
@@ -311,6 +315,23 @@ def test_training_csv_tensorboard_and_best_checkpoint(
         best = runner.train()
         metrics = runner.test(best)
         assert "monitor_accumulator" not in metrics
+        assert any(
+            phase == "training"
+            and details["completed_steps"] == total_steps
+            for phase, details in status_events
+        )
+        assert any(
+            phase == "validation"
+            and details["completed_batches"] == 1
+            and details["total_batches"] == 1
+            for phase, details in status_events
+        )
+        assert any(
+            phase == "test"
+            and details["completed_batches"] == 1
+            and details["total_batches"] == 1
+            for phase, details in status_events
+        )
     finally:
         runner.monitor.close()
         runner.progress.close()
