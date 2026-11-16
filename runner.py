@@ -10,6 +10,7 @@ loss. A negative checkpoint interval disables disk saves, not model selection.
 import copy
 import logging
 import os
+import random
 import warnings
 from pathlib import Path
 
@@ -68,6 +69,7 @@ class Runner:
         self.monitor = None
         self.rank_indices = None
         self.best_step = None
+        self.best_validation_loss = None
         if self.output_tb and task.cfg.name != "spec_pretrain":
             self.logger = SummaryWriter(
                 str(Path(self.exp_dir) / "tensorboard")
@@ -88,8 +90,10 @@ class Runner:
             disable=cfg.get("quiet", False),
         )
 
-        if "start_from_ckpt" in cfg:
-            self.load_from_ckpt()
+        if cfg.get("resume_from_ckpt") is not None:
+            self.restore_managed_checkpoint()
+        elif "start_from_ckpt" in cfg:
+            self.load_from_ckpt(cfg.start_from_ckpt)
 
         if task.cfg.name == "spec_pretrain":
             from criterions.pretrain_masked_criterion import CONTENT_THRESHOLD
@@ -100,8 +104,11 @@ class Runner:
                 extractor = STFTPreprocessor(task.dataset.preprocessor_cfg)
             base = Path(self.exp_dir)
             root = base.parent if base.name == "checkpoints" else base
+            monitor_root = Path(
+                cfg.get("monitor_root", root / "monitoring")
+            )
             self.monitor = TrainingMonitor(
-                root / "monitoring",
+                monitor_root,
                 extractor.frequency_axis(),
                 criterion.cfg.alpha,
                 CONTENT_THRESHOLD,
@@ -110,8 +117,7 @@ class Runner:
                 tensorboard=self.output_tb,
             )
 
-    def load_from_ckpt(self):
-        ckpt_path = self.cfg.start_from_ckpt
+    def load_from_ckpt(self, ckpt_path):
         init_state = torch.load(
             ckpt_path, map_location=self.device, weights_only=False
         )
@@ -126,6 +132,27 @@ class Runner:
                 "restoration is unavailable for this legacy checkpoint."
             )
         self.scheduler.load_state_dict(scheduler_state)
+        return init_state
+
+    def restore_managed_checkpoint(self):
+        """Restore optimizer progress and the selected best snapshot."""
+        last = self.load_from_ckpt(self.cfg.resume_from_ckpt)
+        best = torch.load(
+            self.cfg.resume_best_ckpt,
+            map_location=self.device, weights_only=False,
+        )
+        self.completed_steps = last["completed_steps"]
+        self.progress.n = self.completed_steps
+        self.best_step = last["best_step"]
+        self.best_validation_loss = last["best_validation_loss"]
+        self.resumed_best_state = best["model"]
+        random.setstate(last["python_rng"])
+        np.random.set_state(last["numpy_rng"])
+        torch.set_rng_state(last["torch_rng"].cpu())
+        if torch.cuda.is_available() and "cuda_rng" in last:
+            torch.cuda.set_rng_state_all(
+                [state.cpu() for state in last["cuda_rng"]]
+            )
 
     def _init_optim(self, args):
         if args.optim == "SGD":
@@ -263,17 +290,47 @@ class Runner:
             self.model, all_states, self.cfg.multi_gpu
         )
         all_states["completed_steps"] = self.completed_steps
+        all_states["best_step"] = self.best_step
+        all_states["best_validation_loss"] = (
+            self.best_validation_loss
+        )
+        all_states["python_rng"] = random.getstate()
+        all_states["numpy_rng"] = np.random.get_state()
+        all_states["torch_rng"] = torch.get_rng_state()
+        if torch.cuda.is_available():
+            all_states["cuda_rng"] = torch.cuda.get_rng_state_all()
         all_states["optim"] = self.optim.state_dict()
         all_states["scheduler"] = self.scheduler.get_state_dict()
         if self.cfg.multi_gpu:
             all_states["model_cfg"] = self.model.module.cfg
         else:
             all_states["model_cfg"] = self.model.cfg
-        self.save_checkpoint_last(all_states)
-        if best_val:
-            self.save_checkpoint_last(all_states, best_val)
+        if not best_val:
+            self.save_checkpoint_last(all_states)
+            return
+        best_path = Path(self.exp_dir) / "checkpoint_best.pth"
+        previous = Path(self.exp_dir) / "checkpoint_best.previous.pth"
+        if previous.exists():
+            raise RuntimeError(
+                f"Unresolved best-checkpoint backup: {previous.resolve()}"
+            )
+        if best_path.exists():
+            os.link(best_path, previous)
+        try:
+            self.save_checkpoint_last(all_states, best_val=True)
+            self.save_checkpoint_last(all_states)
+        except BaseException:
+            if previous.exists():
+                os.replace(previous, best_path)
+            else:
+                best_path.unlink(missing_ok=True)
+            raise
+        previous.unlink(missing_ok=True)
 
-    def run_epoch(self, train_loader, total_loss, best_state):
+    def run_epoch(
+        self, train_loader, total_loss, best_state,
+        epoch_complete=True,
+    ):
         best_model, best_val = best_state
         for batch_index, batch in enumerate(train_loader):
             if self.progress.n >= self.progress.total:
@@ -374,7 +431,9 @@ class Runner:
                     if epoch_end:
                         self.monitor.record_epoch(
                             self.epoch_index, self.completed_steps,
-                            stats, batch_index == len(train_loader) - 1,
+                            stats,
+                            epoch_complete
+                            and batch_index == len(train_loader) - 1,
                         )
                 val_loss = valid_logging_outs["loss"]
                 if not np.isfinite(val_loss):
@@ -382,6 +441,7 @@ class Runner:
                 if val_loss < best_val["loss"]:
                     self.best_step = self.completed_steps
                     best_val = valid_logging_outs.copy()
+                    self.best_validation_loss = float(val_loss)
                     best_model = copy.deepcopy(self.model)
                     if self.cfg.checkpoint_step > -1:
                         self.save_checkpoints(best_val=True)
@@ -468,16 +528,39 @@ class Runner:
         total_loss = []
         best_val = {"loss": float("inf")}
         best_model = None
+        if self.completed_steps:
+            best_val = {"loss": self.best_validation_loss}
+            best_model = copy.deepcopy(self.model)
+            self.task.load_model_weights(
+                best_model, self.resumed_best_state,
+                self.cfg.multi_gpu,
+            )
+            del self.resumed_best_state
+            self.monitor.start_step = self.completed_steps + 1
         best_state = (best_model, best_val)
         with logging_redirect_tqdm():
-            if self.cfg.checkpoint_step > -1:
+            if self.cfg.checkpoint_step > -1 and not self.completed_steps:
                 self.save_checkpoints()
-            self.epoch_index = 0
+            self.epoch_index = self.completed_steps // self.steps_per_epoch
+            skipped = self.completed_steps % self.steps_per_epoch
             while self.progress.n < self.progress.total:
                 self.epoch_index += 1
+                remaining = train_loader
+                if skipped:
+                    offset = skipped * self.cfg.train_batch_size
+                    indices = range(offset, len(self.task.train_set))
+                    remaining = self.get_batch_iterator(
+                        Subset(self.task.train_set, indices),
+                        self.cfg.train_batch_size,
+                        shuffle=False,
+                        num_workers=self.cfg.num_workers,
+                        persistent_workers=self.cfg.num_workers > 0,
+                    )
                 total_loss, best_state = self.run_epoch(
-                    train_loader, total_loss, best_state
+                    remaining, total_loss, best_state,
+                    epoch_complete=not bool(skipped),
                 )
+                skipped = 0
             self.progress.close()
         return best_state[0]
 

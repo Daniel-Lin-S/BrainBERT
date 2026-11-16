@@ -238,21 +238,35 @@ def execute(cfg: object) -> dict:
         if run.reused:
             log.info("Reusing completed fit %s", run.fit_id)
             return json.loads((run.path / "results.json").read_text())
-        write_json(
-            run.path / "provenance.json",
-            {
-                "python": sys.version,
-                "torch": torch.__version__,
-                "cuda": torch.version.cuda,
-                "source_root": str(Path(task.dataset.root_dir).resolve()),
-                "git_revision": subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], text=True
-                ).strip(),
-                "invocation": OmegaConf.to_container(cfg, resolve=True),
-            },
-        )
+        if not run.resumed:
+            write_json(
+                run.path / "provenance.json",
+                {
+                    "python": sys.version,
+                    "torch": torch.__version__,
+                    "cuda": torch.version.cuda,
+                    "source_root": str(Path(task.dataset.root_dir).resolve()),
+                    "git_revision": subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"], text=True
+                    ).strip(),
+                    "invocation": OmegaConf.to_container(
+                        cfg, resolve=True
+                    ),
+                },
+            )
         with open_dict(cfg):
             cfg.exp.runner.artifact_dir = str(run.path / "checkpoints")
+            if run.resumed:
+                checkpoints = run.path / "checkpoints"
+                cfg.exp.runner.resume_from_ckpt = str(
+                    checkpoints / "checkpoint_last.pth"
+                )
+                cfg.exp.runner.resume_best_ckpt = str(
+                    checkpoints / "checkpoint_best.pth"
+                )
+                cfg.exp.runner.monitor_root = str(
+                    run.path / "monitoring/segments" / run.invocation
+                )
         runner = None
         try:
             if (
@@ -282,10 +296,15 @@ def execute(cfg: object) -> dict:
             criterion = task.build_criterion(cfg.criterion)
             runner = Runner(cfg.exp.runner, task, model, criterion)
             runner.status_callback = run.status
+            steps_per_epoch = math.ceil(
+                len(task.train_set) / cfg.exp.runner.train_batch_size
+            )
+            completed_epochs = runner.completed_steps // steps_per_epoch
             run.status(
-                "training", completed_steps=0,
+                "training", completed_steps=runner.completed_steps,
                 total_steps=cfg.exp.runner.total_steps,
-                epoch=0, completed_epochs=0,
+                epoch=completed_epochs,
+                completed_epochs=completed_epochs,
                 total_epochs=cfg.exp.runner.get("epochs"),
             )
             best = runner.train()

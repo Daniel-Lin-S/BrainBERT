@@ -19,7 +19,13 @@ and validation schedule remain those of the existing pipeline.
 
 Reusable checkpoints live in `fits/<scientific-hash>/checkpoints` beneath the
 artifact root. Campaign directories contain references, not copies. Completed
-fits are checked before reuse; incomplete attempts are quarantined on retry.
+fits are checked before reuse. An incomplete fit with matching last and
+best checkpoints and an unshuffled training order resumes its model,
+optimizer, scheduler, and step count;
+invalid or uncheckpointed attempts are quarantined. Only the latest and best
+checkpoints are retained, so an interruption can lose updates since the most
+recent checkpoint. Resumed monitoring writes a new segment without replacing
+previous monitor records.
 Checkpoint replacement stages, backs up, audits, and atomically installs the
 new file before removing the backup. Only best and last checkpoints are kept.
 

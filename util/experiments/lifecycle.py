@@ -3,7 +3,8 @@
 ``fits/<hash>/`` contains scientific.json, provenance.json, checkpoints/,
 results.json, and complete.json (artifact checksums, written last).
 ``campaigns/<name>/fits/<hash>.json`` references that shared fit without copying
-results. Failed attempts move to quarantine/<hash>/<invocation>/ on retry.
+results. Valid incomplete checkpoints resume; invalid attempts move to
+quarantine/<hash>/<invocation>/ on retry.
 Small logs live at logs/<campaign>/<invocation>/{status,training,errors}/.
 Scientific identity excludes placement, device, workers, and logging options.
 """
@@ -11,6 +12,7 @@ Scientific identity excludes placement, device, workers, and logging options.
 import fcntl
 import json
 import logging
+import math
 import re
 import uuid
 from datetime import datetime, timezone
@@ -44,6 +46,9 @@ OPERATIONAL_RUNNER = {
     "gpu_memory_fraction",
     "cpu_threads",
     "train_monitor_step",
+    "resume_from_ckpt",
+    "resume_best_ckpt",
+    "monitor_root",
 }
 STATUS_FIELDS = {
     "completed_sessions", "total_sessions", "detail",
@@ -130,6 +135,7 @@ class FitRun:
         self.lock = None
         self.handler = None
         self.reused = False
+        self.resumed = False
 
     def __enter__(self) -> "FitRun":
         lock_path = self.root / "locks" / f"{self.fit_id}.lock"
@@ -179,12 +185,14 @@ class FitRun:
                     )
             self.reused = True
         elif self.path.exists():
-            quarantine = (
-                self.root / "quarantine" / self.fit_id / self.invocation
-            )
-            quarantine.parent.mkdir(parents=True, exist_ok=True)
-            self.path.rename(quarantine)
-        if not self.reused:
+            self.resumed = self._has_valid_recovery()
+            if not self.resumed:
+                quarantine = (
+                    self.root / "quarantine" / self.fit_id / self.invocation
+                )
+                quarantine.parent.mkdir(parents=True, exist_ok=True)
+                self.path.rename(quarantine)
+        if not self.reused and not self.resumed:
             write_json(self.path / "scientific.json", self.scientific)
         for folder in ("status", "training", "errors"):
             (self.logs / folder).mkdir(parents=True, exist_ok=True)
@@ -192,8 +200,66 @@ class FitRun:
         self.handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
         logging.getLogger().addHandler(self.handler)
         logging.getLogger().setLevel(logging.INFO)
-        self.status("reused" if self.reused else "running")
+        phase = "reused" if self.reused else (
+            "resuming" if self.resumed else "running"
+        )
+        self.status(phase)
         write_json(self.reference, {"fit_id": self.fit_id})
+
+    def _has_valid_recovery(self) -> bool:
+        """Accept only matching last/best checkpoints for this fit."""
+        import torch
+
+        scientific_path = self.path / "scientific.json"
+        last_path = self.path / "checkpoints/checkpoint_last.pth"
+        best_path = self.path / "checkpoints/checkpoint_best.pth"
+        if not all(
+            path.is_file()
+            for path in (scientific_path, last_path, best_path)
+        ):
+            return False
+        if json.loads(scientific_path.read_text()) != self.scientific:
+            return False
+        if self.scientific["runner"].get("shuffle", False):
+            return False
+        try:
+            last = torch.load(
+                last_path, map_location="cpu", weights_only=False
+            )
+            best = torch.load(
+                best_path, map_location="cpu", weights_only=False
+            )
+            step = last["completed_steps"]
+            best_step = last["best_step"]
+            loss = last["best_validation_loss"]
+            previous = best_path.with_name(
+                "checkpoint_best.previous.pth"
+            )
+            if best["completed_steps"] != best_step and previous.exists():
+                saved = torch.load(
+                    previous, map_location="cpu", weights_only=False
+                )
+                if saved["completed_steps"] == best_step:
+                    previous.replace(best_path)
+                    best = saved
+            if best["completed_steps"] == best_step:
+                previous.unlink(missing_ok=True)
+            required = (
+                "optim", "scheduler", "model", "python_rng",
+                "numpy_rng", "torch_rng",
+            )
+            return (
+                isinstance(step, int) and 0 < step <=
+                self.scientific["runner"]["total_steps"]
+                and isinstance(best_step, int)
+                and 0 < best_step <= step
+                and best["completed_steps"] == best_step
+                and math.isfinite(float(loss))
+                and all(key in last for key in required)
+                and "model" in best
+            )
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return False
 
     def status(self, phase: str, **details: object) -> None:
         """Replace lifecycle progress without saving model metrics."""

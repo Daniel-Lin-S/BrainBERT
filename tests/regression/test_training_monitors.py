@@ -458,6 +458,42 @@ def test_training_csv_tensorboard_and_best_checkpoint(
     )
 
 
+def test_incomplete_fit_resumes_from_two_checkpoints(tmp_path):
+    """Preserve an incomplete fit only with matched recovery states."""
+    import random
+
+    scientific = {"runner": {"total_steps": 5, "shuffle": False}}
+    root = tmp_path / "artifacts"
+    logs = tmp_path / "logs"
+    with FitRun(root, logs, "recovery", scientific) as first:
+        checkpoints = first.path / "checkpoints"
+        checkpoints.mkdir()
+        state = {
+            "completed_steps": 3,
+            "best_step": 3,
+            "best_validation_loss": 1.0,
+            "model": {},
+            "optim": {},
+            "scheduler": {},
+            "python_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "torch_rng": torch.get_rng_state(),
+        }
+        torch.save(state, checkpoints / "checkpoint_last.pth")
+        best_path = checkpoints / "checkpoint_best.pth"
+        torch.save(state, best_path)
+        previous = checkpoints / "checkpoint_best.previous.pth"
+        previous.write_bytes(best_path.read_bytes())
+        torch.save({**state, "completed_steps": 4}, best_path)
+    with FitRun(root, logs, "recovery", scientific) as resumed:
+        assert resumed.resumed
+        assert resumed.path == first.path
+        assert not resumed.reused
+    assert (first.path / "checkpoints/checkpoint_last.pth").is_file()
+    assert not previous.exists()
+    assert torch.load(best_path, weights_only=False)["completed_steps"] == 3
+
+
 def test_completion_integrity_and_legacy_reuse(tmp_path):
     for monitoring in (False, True):
         scientific = {"monitoring_fixture": monitoring}
