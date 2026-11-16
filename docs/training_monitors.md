@@ -141,5 +141,11 @@ validation and test coverage describe their evaluation passes. A count can
 rise simply because more windows were observed, so use `selection_rate` when
 comparing frequencies or passes.
 
-TensorBoard shows the loss and optimization curves, a heatmap of the nine
-conditional L1 values, and frequency coverage plots derived from these tables.
+TensorBoard shows one overall series for each diagnostic and six margin
+summaries: three selection-strategy totals and three replacement-action
+totals. Each margin shows count, content count, L1, content L1, and their
+zero-baseline-relative versions. The full nine-cell grid, raw aggregation
+sums, and per-frequency rows remain in the CSV tables. Heatmaps and frequency
+coverage figures remain available. A configured `train_monitor_step` writes
+training-only summaries between validation passes without evaluating the
+validation set; the AJILE pilot uses 100 optimizer updates.

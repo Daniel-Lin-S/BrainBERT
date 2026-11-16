@@ -325,6 +325,19 @@ class Runner:
                 )
             )
             ckpt_step = ckpt_step or epoch_end
+            monitor_step = self.cfg.get("train_monitor_step")
+            if (
+                self.monitor is not None
+                and monitor_step is not None
+                and self.completed_steps > 1
+                and (self.completed_steps - 1) % monitor_step == 0
+                and not (ckpt_step or log_step)
+            ):
+                self.monitor.record(
+                    "train", self.completed_steps, self.monitor.train,
+                    learning_rates=learning_rates, plot_images=False,
+                )
+                self.monitor.train = Accumulator()
             valid_logging_outs = {}
             saved_best = False
             if ckpt_step or log_step:
@@ -447,6 +460,11 @@ class Runner:
             raise ValueError("total_steps and log_step must be positive.")
         if self.cfg.checkpoint_step == 0:
             raise ValueError("checkpoint_step must be positive or negative.")
+        monitor_step = self.cfg.get("train_monitor_step")
+        if monitor_step is not None and (
+            not isinstance(monitor_step, int) or monitor_step <= 0
+        ):
+            raise ValueError("train_monitor_step must be a positive integer.")
         total_loss = []
         best_val = {"loss": float("inf")}
         best_model = None

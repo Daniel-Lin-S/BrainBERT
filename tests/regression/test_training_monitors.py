@@ -275,17 +275,23 @@ def read_rows(root, name):
 
 @pytest.mark.parametrize(
     "total_steps, log_step, checkpoint_step, epoch_end, "
-    "expected_steps, expected_batches, expected_starts",
+    "train_monitor_step, expected_steps, expected_valid_steps, "
+    "expected_batches, expected_starts",
     [
-        (4, 2, 2, False, [1, 3, 4], [1, 2, 1], [1, 2, 4]),
-        (5, 3, 2, False, [1, 3, 4, 5], [1, 2, 1, 1], [1, 2, 4, 5]),
-        (5, 3, 2, True, [1, 2, 3, 4, 5],
-         [1, 1, 1, 1, 1], [1, 2, 3, 4, 5]),
+        (4, 2, 2, False, None, [1, 3, 4], [1, 3, 4],
+         [1, 2, 1], [1, 2, 4]),
+        (5, 3, 2, False, None, [1, 3, 4, 5], [1, 3, 4, 5],
+         [1, 2, 1, 1], [1, 2, 4, 5]),
+        (5, 3, 2, True, None, [1, 2, 3, 4, 5],
+         [1, 2, 3, 4, 5], [1, 1, 1, 1, 1], [1, 2, 3, 4, 5]),
+        (5, 4, 4, False, 2, [1, 3, 5], [1, 5],
+         [1, 2, 2], [1, 2, 4]),
     ],
 )
 def test_training_csv_tensorboard_and_best_checkpoint(
     tmp_path, total_steps, log_step, checkpoint_step, epoch_end,
-    expected_steps, expected_batches, expected_starts,
+    train_monitor_step, expected_steps, expected_valid_steps,
+    expected_batches, expected_starts,
 ):
     torch.set_num_threads(1)
     task = SpecPretrain(OmegaConf.create({"name": "spec_pretrain"}))
@@ -319,6 +325,7 @@ def test_training_csv_tensorboard_and_best_checkpoint(
             "valid_batch_size": 1,
             "num_workers": 0,
             "shuffle": False,
+            "train_monitor_step": train_monitor_step,
             "grad_clip": 1.0,
             "scheduler": {
                 "name": "ramp_up",
@@ -375,7 +382,9 @@ def test_training_csv_tensorboard_and_best_checkpoint(
     train = [row for row in rows if row["phase"] == "train"]
     validation = [row for row in rows if row["phase"] == "validation"]
     assert [int(row["step"]) for row in train] == expected_steps
-    assert [int(row["step"]) for row in validation] == expected_steps
+    assert [int(row["step"]) for row in validation] == (
+        expected_valid_steps
+    )
     assert [int(row["batches"]) for row in train] == expected_batches
     assert all("diagnostic_objective" not in row for row in rows)
     assert all(float(row["relative_l1"]) >= 0 for row in train)
@@ -411,13 +420,22 @@ def test_training_csv_tensorboard_and_best_checkpoint(
     )
     for phase, phase_rows in (("train", train), ("validation", validation)):
         events_loss = events.Scalars(f"{phase}/overall/original_loss")
-        assert [point.step for point in events_loss] == expected_steps
+        expected = (
+            expected_steps if phase == "train" else expected_valid_steps
+        )
+        assert [point.step for point in events_loss] == expected
         np.testing.assert_allclose(
             [point.value for point in events_loss],
             [float(row["original_loss"]) for row in phase_rows],
             rtol=1e-6,
         )
+    scalar_tags = events.Tags()["scalars"]
     assert "train/masks/l1" in events.Tags()["images"]
+    assert "train/masks/all/zero/l1" in scalar_tags
+    assert "train/masks/temporal_only/all/content_count" in scalar_tags
+    assert "train/masks/temporal_only/zero/l1" not in scalar_tags
+    assert "train/masks/all/zero/absolute_error_sum" not in scalar_tags
+    assert "train/overall/absolute_error_sum" not in scalar_tags
     groups = read_rows(root, "mask_groups.csv")
     assert len(groups) == len(rows) * 15
     with gzip.open(root / "validation_frequency.csv.gz", "rt") as stream:

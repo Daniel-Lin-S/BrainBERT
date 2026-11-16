@@ -43,6 +43,7 @@ OPERATIONAL_RUNNER = {
     "quiet",
     "gpu_memory_fraction",
     "cpu_threads",
+    "train_monitor_step",
 }
 STATUS_FIELDS = {
     "completed_sessions", "total_sessions", "detail",

@@ -37,6 +37,13 @@ SUM_FIELDS = (
     "prediction_sum",
     "prediction_square_sum",
 )
+TENSORBOARD_GROUP_FIELDS = frozenset({
+    "count", "content_count", "l1", "content_l1",
+    "relative_l1", "relative_content_l1",
+})
+TENSORBOARD_OVERALL_EXCLUDED = frozenset(SUM_FIELDS) - {
+    "count", "content_count",
+}
 ORIGINAL_METRICS = (
     "loss",
     "l1_loss",
@@ -408,9 +415,15 @@ class TrainingMonitor:
                 )
         self.writers[table].writerow(row)
         if self.writer is not None and tag is not None:
+            allowed = (
+                TENSORBOARD_GROUP_FIELDS if tag.startswith("masks/")
+                else set(row) - TENSORBOARD_OVERALL_EXCLUDED
+            )
             for key, value in row.items():
-                if key not in CONTEXT_FIELDS and isinstance(
-                    value, (int, float, np.number)
+                if (
+                    key in allowed
+                    and key not in CONTEXT_FIELDS
+                    and isinstance(value, (int, float, np.number))
                 ):
                     self.writer.add_scalar(
                         f"{row['phase']}/{tag}/{key}", value, row["step"]
@@ -676,7 +689,9 @@ class TrainingMonitor:
                 **summarize(sums, self.alpha),
             },
             f"masks/{strategy}/{action}"
-            if table == "mask_groups" else None,
+            if table == "mask_groups"
+            and (strategy == "all") != (action == "all")
+            else None,
         )
 
     def _coverage(
