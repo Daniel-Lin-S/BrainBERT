@@ -103,6 +103,36 @@ def test_recording_moments_use_only_eligible_electrode_windows(tmp_path):
     )
     assert held_out["identity"] != result["identity"]
     np.testing.assert_allclose(held_out["mean"], result["mean"])
+    validation_valid = np.array([
+        [True, False], [False, True], [False, False]
+    ])
+    validation = recording_statistics(
+        tmp_path, record, "validation", validation_valid, preprocessor
+    )
+    assert not np.array_equal(validation["mean"], result["mean"])
+    for eligible, moments in ((valid, result),
+                              (validation_valid, validation)):
+        for channel in range(2):
+            normalized = np.concatenate([
+                preprocessor(
+                    waveform(
+                        source, record["metadata"], index, channel,
+                        eligible,
+                    )[: OUTPUT - 1],
+                    {
+                        "mean": moments["mean"][channel],
+                        "std": moments["std"][channel],
+                        "identity": moments["identity"],
+                    },
+                ).numpy()
+                for index in np.flatnonzero(eligible[:, channel])
+            ])
+            np.testing.assert_allclose(
+                normalized.mean(axis=0), 0, atol=1e-5
+            )
+            np.testing.assert_allclose(
+                normalized.std(axis=0), 1, atol=1e-5
+            )
 
 
 def test_missing_recording_statistics_fail_clearly():

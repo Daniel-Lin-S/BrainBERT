@@ -70,6 +70,10 @@ class PretrainMaskedCriterion(BaseCriterion):
             "images": images,
             "l1_loss": l1.item(),
             "content_l1": content_l1.item(),
+            "zero_baseline_l1": true_activity.abs().mean().item(),
+            "content_zero_baseline_l1": (
+                true_activity[non_zero_idxs].abs().mean().item()
+            ),
             "content_aware_loss": content_aware_loss.item(),
         }
         if "mask_provenance" in batch:

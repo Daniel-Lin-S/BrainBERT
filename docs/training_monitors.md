@@ -1,63 +1,113 @@
 # Scientific training monitors
 
-Pre-training records diagnostics from its existing batches and evaluation
-passes. Enable TensorBoard using `runtime.output_tb: true` in the shared local
-machine configuration. CSV is always written. These settings do not change
-fit identity or cause completed fits to be retrained.
+BrainBERT predicts the magnitude of selected spectrogram cells. All loss
+values below refer to the preprocessed spectrogram, so their units follow the
+configured STFT normalization rather than the raw signal voltage. Training and
+validation diagnostics are recorded at the same completed-update steps.
+Training summaries cover batches since the preceding evaluation step;
+validation summaries cover the current evaluation pass. These are update-based
+measurements, not full training epochs. The test pass uses the checkpoint
+selected by validation loss.
 
-## Artifact tables
+With the default recording-wise STFT z-score, both phases use deviations
+from an electrode and frequency mean as their scale. Each recording fits
+its own moments from eligible windows in its assigned split, so one
+normalized unit can represent a different raw magnitude across
+recordings. The monitor metadata identifies the normalization mode.
 
-Each fit has a `monitoring` directory beside `checkpoints`:
+## Training objective
 
-| File | Contents |
+Let `target` be the unmasked spectrogram value, `prediction` the model output,
+and `alpha` the configured content weight. Only selected cells contribute.
+
+| Diagnostic in `metrics.csv` | Calculation | Scientific meaning |
+| --- | --- | --- |
+| `original_l1_loss` | Mean `abs(target - prediction)` on selected cells within each batch, then mean across batches | Ordinary reconstruction error in the objective. |
+| `original_content_aware_loss` | Within each batch, mean absolute error on selected cells with `abs(target) > 1`, multiplied by `alpha`; then mean across batches | Extra weight given to high-magnitude targets. |
+| `original_loss` | Sum of the two original batch losses, averaged across batches | The optimization objective; validation values select the best checkpoint. |
+
+The pooled `l1` and `weighted_content_l1` columns in `metrics.csv`
+are calculated across all selected cells in the interval or evaluation pass.
+They can differ from the original batch-mean objective when batches contain
+different numbers of selected cells.
+
+## Mask-conditioned reconstruction
+
+`mask_groups.csv` reports the nine combinations of **selection strategy** and
+**replacement action**:
+
+| Selection strategy | Meaning |
 | --- | --- |
-| `metrics.csv` | Original losses, pooled diagnostics, zero-prediction baseline, target/prediction moments, learning rates, gradient norms and clipping fraction |
-| `mask_groups.csv` | Nine strategy/action groups, plus three strategy and three action marginals; error sums, counts, normalized losses and moments |
-| `frequency_coverage.csv` | Frequency in Hz, selected-cell counts, valid-cell exposures and selection rates; interval/pass and cumulative training coverage |
-| `metadata.json` | Metric definitions, frequency axis, content threshold and weighting, category semantics |
-| `tensorboard/` | Matching scalar curves, conditional-L1 heatmaps and frequency coverage bars |
+| `temporal_only` | Selected by temporal masking alone. |
+| `spectral_only` | Selected by spectral masking alone. |
+| `overlap` | Selected by both; counted once in reconstruction loss. |
 
-Rows identify phase, completed optimizer update, interval boundaries and the
-evaluated checkpoint step. Training records pool all batches since the last
-logging boundary; these predictions were produced by evolving weights.
-Validation pools each existing validation pass. Final test diagnostics use
-the validation-best checkpoint. Coverage counts observations, not unique
-examples across repeated visits. No extra evaluation pass is introduced.
+| Replacement action | Meaning |
+| --- | --- |
+| `zero` | Last replacement set the input cell to zero. |
+| `random` | Last replacement copied another value; that source may itself have been masked. |
+| `unchanged` | Neither strategy replaced the selected cell. |
 
-## Reading conditional losses
+A later masking operation can overwrite an earlier one. A later decision to
+leave a cell unchanged does not undo an earlier replacement. Rows with `all`
+in one dimension pool the corresponding groups across that dimension.
 
-Selection categories are temporal-only, spectral-only and overlapping masks.
-Replacement actions are zero-fill, random replacement and no replacement.
-The action is the last actual write: a later no-op preserves an earlier
-replacement, and a randomly copied source may already contain corruption.
-A coincidental numerical match with the target does not change the action.
+For any group, let `N` be its `count`, `E` its `absolute_error_sum`, `Nc` its
+`content_count`, and `Ec` its `content_error_sum`. The zero baseline always
+predicts zero, the fitted mean of a frequency within an electrode under the
+recording and training-dataset z-score modes:
 
-Every group's L1 is its absolute-error sum divided by **its own selected-cell
-count**. Its content L1 uses its own subset with `abs(target) > 1`; the weighted
-term multiplies that mean by the configured alpha. The diagnostic objective
-adds these two conditional terms. Missing denominators produce empty CSV
-fields and no TensorBoard scalar, never zero loss. Marginals pool sums/counts,
-not group means. Padding is excluded, and overlapping cells count once.
+| Diagnostic | Calculation | Scientific meaning |
+| --- | --- | --- |
+| `l1` | `E / N` | Mean error for cells exposed to this masking condition; its scale does not increase merely because more cells were selected. |
+| `content_l1` | `Ec / Nc`, using only targets with `abs(target) > 1` | Reconstruction error on the group's high-magnitude targets. |
+| `weighted_content_l1` | `alpha * content_l1` | That group's content-aware term at the configured weight. |
+| `zero_baseline_l1` | Mean `abs(target)` over the same `N` cells | L1 error of the zero prediction on this selection. |
+| `relative_l1` | `l1 / zero_baseline_l1` | Reconstruction error relative to the constant prediction: below 1 means the model reconstructs better than zero. |
+| `content_zero_baseline_l1` | Mean `abs(target)` over the same `Nc` high-magnitude cells | Baseline error on exactly the content subset. |
+| `relative_content_l1` | `content_l1 / content_zero_baseline_l1` | High-magnitude reconstruction error relative to the same baseline on that subset. |
+| `target_mean`, `target_std` | Mean and population standard deviation of the group's targets | The target level and variability under this masking condition. |
+| `prediction_mean`, `prediction_std` | Mean and population standard deviation of the group's predictions | Prediction bias and variability; a small prediction standard deviation relative to targets may indicate collapse toward a constant. |
 
-The original objective and checkpoint-selection metric retain their original
-batch-mean reductions. The pooled diagnostic objective can differ and must
-not be substituted for checkpoint selection. Group objectives are not
-additive contributions to the original objective.
+`metrics.csv` reports the same pooled diagnostics over **all** selected cells.
+Its `original_relative_l1` and `original_relative_content_l1` also compare
+the original batch-averaged L1 components to batch-averaged zero-baseline
+errors. Multiplying numerator and denominator by `alpha` would leave the
+content ratio unchanged.
+Group and overall means are formed from error sums and their own cell counts,
+not from an unweighted mean of batch or group means. Counts show how much
+evidence supports each conditional estimate. Differences between groups may
+reflect both model behavior and the difficulty of their masking conditions;
+these rows are not isolated temporal-only or spectral-only experiments.
 
-Normalization removes scaling by the number of masked cells. Sample and mask
-composition can still vary between steps. Counts and target moments help
-interpret this variation; the groups do not represent isolated masking
-experiments. With z-scored STFT input, errors describe standardized magnitude,
-not voltage. The zero-prediction L1 is a reference on the same selected cells,
-not an additional training objective.
+## Optimization dynamics
 
-Frequency bars show masking exposure, **not reconstruction loss**. Their axis
-uses actual STFT bins, rather than the grid used internally to choose mask
-widths. Variable masking and boundary handling need not yield uniform rates;
-monitoring does not rebalance them.
+These `metrics.csv` measures accompany the reconstruction losses:
 
-CSV files and TensorBoard events are flushed at existing logging boundaries
-and before completion checksums. Completed fits are immutable; older fits
-without monitors remain reusable. Failed attempts follow shared quarantine
-rules. No device throughput, resource measurements, parameter histograms or
-per-frequency reconstruction losses are added by these monitors.
+| Diagnostic | Calculation | Scientific meaning |
+| --- | --- | --- |
+| `lr_group_*_last_used` | Learning rate applied to the last update in the training interval, for each optimizer parameter group | Relates changes in loss to the learning-rate schedule. |
+| `gradient_norm_mean` | Mean pre-clipping gradient norm over updates in the interval | Typical gradient scale during optimization. |
+| `gradient_norm_max` | Largest pre-clipping gradient norm in the interval | Detects occasional large gradients hidden by the mean. |
+| `clipping_fraction` | Fraction of interval updates whose pre-clipping norm exceeded the configured clipping threshold | How often gradient clipping constrained updates. |
+
+## Frequency masking coverage
+
+`frequency_coverage.csv` uses the actual STFT bin centers in Hz. It measures
+**how often** each frequency was selected, not its reconstruction error.
+
+| Diagnostic | Calculation | Scientific meaning |
+| --- | --- | --- |
+| `selected_cells` | Number of selected time-frequency cells at the bin | Absolute exposure to the specified masking strategy. |
+| `valid_cells` | Number of non-padding cells available at the bin | Exposure denominator. |
+| `selection_rate` | `selected_cells / valid_cells` | Fraction of available cells selected; compare across frequencies to assess masking balance. |
+
+The `temporal_only`, `spectral_only`, and `overlap` series partition selected
+cells. `temporal` and `spectral` each include overlaps; `union` counts each
+selected cell once. Training has both interval and cumulative coverage, while
+validation and test coverage describe their evaluation passes. A count can
+rise simply because more windows were observed, so use `selection_rate` when
+comparing frequencies or passes.
+
+TensorBoard shows the loss and optimization curves, a heatmap of the nine
+conditional L1 values, and frequency coverage plots derived from these tables.

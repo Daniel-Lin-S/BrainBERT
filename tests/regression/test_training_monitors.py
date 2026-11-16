@@ -2,6 +2,7 @@
 
 import copy
 import csv
+import json
 import random
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
+from torch.utils.data import Subset
 from tensorboard.backend.event_processing.event_accumulator import (
     EventAccumulator,
 )
@@ -60,6 +62,9 @@ def outs(stats):
         "loss": 3.0,
         "l1_loss": 1.0,
         "content_aware_loss": 2.0,
+        "content_l1": 1.0,
+        "zero_baseline_l1": 2.0,
+        "content_zero_baseline_l1": 2.0,
         "grad_norm": 2.0,
     }
 
@@ -71,7 +76,14 @@ def test_group_denominators_and_pooling():
         assert result["count"] == 1
         assert result["l1"] == i
         assert result["content_l1"] == (None if i == 1 else i)
-        assert result["diagnostic_objective"] == (None if i == 1 else 3 * i)
+        assert "diagnostic_objective" not in result
+        assert result["relative_l1"] == pytest.approx(
+            i / abs([2.0, 0.5, -2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][i])
+        )
+        if i == 1:
+            assert result["relative_content_l1"] is None
+        else:
+            assert result["relative_content_l1"] == result["relative_l1"]
         assert result["target_std"] == result["prediction_std"] == 0
     pooled = Accumulator()
     pooled.add(outs(stats), 1.0)
@@ -79,7 +91,7 @@ def test_group_denominators_and_pooling():
     np.testing.assert_allclose(pooled.sums, sample_stats(4)["sums"])
     for a, b in zip(pooled.sums, stats["sums"]):
         assert summarize(a, 2.0)["l1"] == summarize(b, 2.0)["l1"]
-    assert summarize(np.zeros(9), 2.0)["l1"] is None
+    assert summarize(np.zeros(10), 2.0)["l1"] is None
     assert pooled.clipped == 2
 
 
@@ -232,7 +244,18 @@ def read_rows(root, name):
         return list(csv.DictReader(stream))
 
 
-def test_training_csv_tensorboard_and_best_checkpoint(tmp_path):
+@pytest.mark.parametrize(
+    "total_steps, log_step, checkpoint_step, expected_steps, "
+    "expected_batches, expected_starts",
+    [
+        (4, 2, 2, [1, 3, 4], [1, 2, 1], [1, 2, 4]),
+        (5, 3, 2, [1, 3, 4, 5], [1, 2, 1, 1], [1, 2, 4, 5]),
+    ],
+)
+def test_training_csv_tensorboard_and_best_checkpoint(
+    tmp_path, total_steps, log_step, checkpoint_step, expected_steps,
+    expected_batches, expected_starts,
+):
     torch.set_num_threads(1)
     task = SpecPretrain(OmegaConf.create({"name": "spec_pretrain"}))
     extractor = STFTPreprocessor(
@@ -242,9 +265,10 @@ def test_training_csv_tensorboard_and_best_checkpoint(tmp_path):
         extractor.frequency_axis(), np.arange(40) * 5.12
     )
     task.dataset = SimpleNamespace(extracter=extractor)
-    task.train_set = [example(), example()]
-    task.valid_set = [example()]
-    task.test_set = [example()]
+    examples = [example() for _ in range(4)]
+    task.train_set = Subset(examples, [0, 1])
+    task.valid_set = Subset(examples, [2])
+    task.test_set = Subset(examples, [3])
     criterion = PretrainMaskedCriterion()
     criterion.build_criterion(OmegaConf.create({"alpha": 2.0}))
     cfg = OmegaConf.create(
@@ -256,18 +280,28 @@ def test_training_csv_tensorboard_and_best_checkpoint(tmp_path):
             "quiet": True,
             "optim": "SGD",
             "lr": 0.001,
-            "total_steps": 4,
-            "log_step": 2,
-            "checkpoint_step": 2,
+            "total_steps": total_steps,
+            "log_step": log_step,
+            "checkpoint_step": checkpoint_step,
             "train_batch_size": 1,
             "valid_batch_size": 1,
             "num_workers": 0,
             "shuffle": False,
             "grad_clip": 1.0,
-            "scheduler": {"name": "ramp_up", "warmup": 0.5, "total_steps": 4},
+            "scheduler": {
+                "name": "ramp_up",
+                "warmup": 0.5,
+                "total_steps": total_steps,
+            },
         }
     )
     runner = Runner(cfg, task, TinyModel(), criterion)
+    if checkpoint_step != log_step:
+        shared_validation = task.valid_set
+        task.valid_set = [example()]
+        with pytest.raises(ValueError, match="same source dataset"):
+            runner.train()
+        task.valid_set = shared_validation
     try:
         best = runner.train()
         metrics = runner.test(best)
@@ -276,11 +310,19 @@ def test_training_csv_tensorboard_and_best_checkpoint(tmp_path):
         runner.monitor.close()
         runner.progress.close()
     root = tmp_path / "monitoring"
+    with (root / "metadata.json").open() as stream:
+        metadata = json.load(stream)
+    assert metadata["stft_normalization_mode"] == "recording_zscore"
     rows = read_rows(root, "metrics.csv")
     train = [row for row in rows if row["phase"] == "train"]
-    assert [int(row["step"]) for row in train] == [1, 3, 4]
-    assert [int(row["batches"]) for row in train] == [1, 2, 1]
-    assert [int(row["interval_start"]) for row in train] == [1, 2, 4]
+    validation = [row for row in rows if row["phase"] == "validation"]
+    assert [int(row["step"]) for row in train] == expected_steps
+    assert [int(row["step"]) for row in validation] == expected_steps
+    assert [int(row["batches"]) for row in train] == expected_batches
+    assert all("diagnostic_objective" not in row for row in rows)
+    assert all(float(row["relative_l1"]) >= 0 for row in train)
+    assert all(float(row["original_relative_l1"]) >= 0 for row in train)
+    assert [int(row["interval_start"]) for row in train] == expected_starts
     checkpoint = torch.load(
         tmp_path / "checkpoints/checkpoint_best.pth", weights_only=False
     )
@@ -293,6 +335,14 @@ def test_training_csv_tensorboard_and_best_checkpoint(tmp_path):
         [float(row["l1"]) for row in train],
         rtol=1e-6,
     )
+    for phase, phase_rows in (("train", train), ("validation", validation)):
+        events_loss = events.Scalars(f"{phase}/overall/original_loss")
+        assert [point.step for point in events_loss] == expected_steps
+        np.testing.assert_allclose(
+            [point.value for point in events_loss],
+            [float(row["original_loss"]) for row in phase_rows],
+            rtol=1e-6,
+        )
     assert "train/masks/l1" in events.Tags()["images"]
     groups = read_rows(root, "mask_groups.csv")
     assert len(groups) == len(rows) * 15
@@ -301,7 +351,7 @@ def test_training_csv_tensorboard_and_best_checkpoint(tmp_path):
         r
         for r in coverage
         if r["phase"] == "train"
-        and r["step"] == "4"
+        and r["step"] == str(total_steps)
         and r["scope"] == "cumulative"
         and r["strategy"] == "union"
     ]
@@ -322,7 +372,8 @@ def test_completion_integrity_and_legacy_reuse(tmp_path):
                 (checkpoints / f"checkpoint_{name}.pth").write_bytes(b"test")
             if monitoring:
                 monitor = TrainingMonitor(
-                    run.path / "monitoring", np.arange(9), 2.0, 1.0, 1, False
+                    run.path / "monitoring", np.arange(9), 2.0, 1.0,
+                    1, "recording_zscore", False,
                 )
                 accumulator = Accumulator()
                 accumulator.add(outs(sample_stats()))

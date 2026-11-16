@@ -27,7 +27,14 @@ class SpecPretrain(BaseTask):
                 "Evaluation loader must contain at least one batch."
             )
         model.eval()
-        all_outs = {"loss": 0, "content_aware_loss": 0, "l1_loss": 0}
+        all_outs = {
+            "loss": 0,
+            "content_aware_loss": 0,
+            "l1_loss": 0,
+            "content_l1": 0,
+            "zero_baseline_l1": 0,
+            "content_zero_baseline_l1": 0,
+        }
         monitor = Accumulator()
         with torch.no_grad():
             for batch in valid_loader:
@@ -39,6 +46,11 @@ class SpecPretrain(BaseTask):
                     "content_aware_loss"
                 ]
                 all_outs["l1_loss"] += valid_outs["l1_loss"]
+                all_outs["content_l1"] += valid_outs["content_l1"]
+                all_outs["zero_baseline_l1"] += valid_outs["zero_baseline_l1"]
+                all_outs["content_zero_baseline_l1"] += valid_outs[
+                    "content_zero_baseline_l1"
+                ]
         for key in all_outs:
             all_outs[key] /= len(valid_loader)
         if monitor.batches:

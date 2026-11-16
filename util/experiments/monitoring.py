@@ -28,12 +28,20 @@ SUM_FIELDS = (
     "content_count",
     "content_error_sum",
     "zero_baseline_error_sum",
+    "content_zero_baseline_error_sum",
     "target_sum",
     "target_square_sum",
     "prediction_sum",
     "prediction_square_sum",
 )
-ORIGINAL_METRICS = ("loss", "l1_loss", "content_aware_loss")
+ORIGINAL_METRICS = (
+    "loss",
+    "l1_loss",
+    "content_l1",
+    "content_aware_loss",
+    "zero_baseline_l1",
+    "content_zero_baseline_l1",
+)
 GROUPS = len(STRATEGIES) * len(ACTIONS)
 CONTEXT_FIELDS = {
     "phase",
@@ -69,7 +77,7 @@ def batch_statistics(
     Returns
     -------
     dict
-        Float64 (9, 9) sufficient statistics, int64 (3, F) selection counts,
+        Float64 (9, 10) sufficient statistics, int64 (3, F) counts,
         and int64 (F,) valid-cell exposures, on the CPU.
     """
     selection = provenance["selection"].to(output.device)
@@ -104,6 +112,7 @@ def batch_statistics(
             content.double(),
             error * content,
             y.abs(),
+            y.abs() * content,
             y,
             y.square(),
             p,
@@ -166,7 +175,7 @@ class Accumulator:
 
 
 def summarize(sums: np.ndarray, alpha: float) -> dict:
-    """Convert one group's nine sums into conditional population metrics."""
+    """Convert one group's ten sums into conditional population metrics."""
     if not np.isfinite(sums).all():
         raise ValueError("Monitor statistics must be finite.")
     result = dict(zip(SUM_FIELDS, sums.tolist()))
@@ -176,11 +185,11 @@ def summarize(sums: np.ndarray, alpha: float) -> dict:
     result["l1"] = sums[1] / n if n else None
     result["content_l1"] = sums[3] / nc if nc else None
     result["weighted_content_l1"] = alpha * sums[3] / nc if nc else None
-    result["diagnostic_objective"] = (
-        result["l1"] + result["weighted_content_l1"] if n and nc else None
-    )
     result["zero_baseline_l1"] = sums[4] / n if n else None
-    for name, i in (("target", 5), ("prediction", 7)):
+    result["content_zero_baseline_l1"] = sums[5] / nc if nc else None
+    result["relative_l1"] = sums[1] / sums[4] if sums[4] > 0 else None
+    result["relative_content_l1"] = sums[3] / sums[5] if sums[5] > 0 else None
+    for name, i in (("target", 6), ("prediction", 8)):
         mean = sums[i] / n if n else None
         result[f"{name}_mean"] = mean
         # Roundoff can make the population variance slightly negative.
@@ -199,6 +208,7 @@ class TrainingMonitor:
         alpha: float,
         threshold: float,
         optimizer_groups: int,
+        normalization_mode: str,
         tensorboard: bool = True,
     ) -> None:
         """Create writers; tensorboard is optional and defaults to True.
@@ -213,6 +223,8 @@ class TrainingMonitor:
             Existing content weighting and absolute-target threshold.
         optimizer_groups : int
             Number of optimizer groups for stable learning-rate columns.
+        normalization_mode : str
+            STFT normalization applied by the shared source dataset.
         tensorboard : bool, optional
             Enable event output, default True; CSV is always written.
         """
@@ -228,6 +240,10 @@ class TrainingMonitor:
         if optimizer_groups <= 0:
             raise ValueError(
                 "Expected at least one optimizer parameter group."
+            )
+        if not isinstance(normalization_mode, str) or not normalization_mode:
+            raise ValueError(
+                "Monitoring requires an explicit STFT normalization mode."
             )
         self.lr_groups = optimizer_groups
         self.alpha = alpha
@@ -252,6 +268,7 @@ class TrainingMonitor:
                 "alpha": alpha,
                 "content_threshold": threshold,
                 "units": "preprocessed spectrogram magnitude",
+                "stft_normalization_mode": normalization_mode,
                 "normalization": "sum of cell errors / own selected-cell count",
                 "content_normalization": (
                     "own count with " "abs(target) > threshold"
@@ -349,6 +366,18 @@ class TrainingMonitor:
                 f"original_{k}": v / accumulator.batches
                 for k, v in accumulator.original.items()
             }
+        )
+        baseline = accumulator.original["zero_baseline_l1"]
+        content_baseline = accumulator.original["content_zero_baseline_l1"]
+        overall["original_relative_l1"] = (
+            accumulator.original["l1_loss"] / baseline
+            if baseline > 0
+            else None
+        )
+        overall["original_relative_content_l1"] = (
+            accumulator.original["content_l1"] / content_baseline
+            if content_baseline > 0
+            else None
         )
         overall["batches"] = accumulator.batches
         overall.update(

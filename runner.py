@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch_optimizer as torch_optim
 from tensorboardX import SummaryWriter
+from torch.utils.data import Subset
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -100,6 +101,7 @@ class Runner:
                 criterion.cfg.alpha,
                 CONTENT_THRESHOLD,
                 optimizer_groups=len(self.optim.param_groups),
+                normalization_mode=extractor.cfg.normalizing,
                 tensorboard=self.output_tb,
             )
 
@@ -262,6 +264,13 @@ class Runner:
                 if self.monitor is not None:
                     stats = valid_logging_outs.pop("monitor_accumulator")
                     self.monitor.record(
+                        "train",
+                        self.completed_steps,
+                        self.monitor.train,
+                        learning_rates=learning_rates,
+                    )
+                    self.monitor.train = Accumulator()
+                    self.monitor.record(
                         "validation",
                         self.completed_steps,
                         stats,
@@ -285,14 +294,6 @@ class Runner:
                         best_validation=best_val,
                     )
             if log_step:
-                if self.monitor is not None:
-                    self.monitor.record(
-                        "train",
-                        self.completed_steps,
-                        self.monitor.train,
-                        learning_rates=learning_rates,
-                    )
-                    self.monitor.train = Accumulator()
                 logging_out["loss"] = np.mean(total_loss)
                 self.output_logs(logging_out, valid_logging_outs)
                 total_loss = []
@@ -308,6 +309,17 @@ class Runner:
         pass
 
     def train(self):
+        if self.monitor is not None:
+            sources = []
+            for subset in (self.task.train_set, self.task.valid_set):
+                while isinstance(subset, Subset):
+                    subset = subset.dataset
+                sources.append(subset)
+            if sources[0] is not sources[1]:
+                raise ValueError(
+                    "Training and validation monitors require the same "
+                    "source dataset and STFT preprocessing settings."
+                )
         train_loader = self.get_batch_iterator(
             self.task.train_set,
             self.cfg.train_batch_size,
