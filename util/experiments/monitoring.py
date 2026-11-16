@@ -425,8 +425,14 @@ class TrainingMonitor:
                     and key not in CONTEXT_FIELDS
                     and isinstance(value, (int, float, np.number))
                 ):
+                    metric = (
+                        "total_loss"
+                        if tag == "overall" and key == "original_loss"
+                        else key
+                    )
                     self.writer.add_scalar(
-                        f"{row['phase']}/{tag}/{key}", value, row["step"]
+                        f"{row['phase']}/{tag}/{metric}",
+                        value, row["step"],
                     )
 
     def record(

@@ -419,7 +419,7 @@ def test_training_csv_tensorboard_and_best_checkpoint(
         rtol=1e-6,
     )
     for phase, phase_rows in (("train", train), ("validation", validation)):
-        events_loss = events.Scalars(f"{phase}/overall/original_loss")
+        events_loss = events.Scalars(f"{phase}/overall/total_loss")
         expected = (
             expected_steps if phase == "train" else expected_valid_steps
         )
@@ -436,6 +436,9 @@ def test_training_csv_tensorboard_and_best_checkpoint(
     assert "train/masks/temporal_only/zero/l1" not in scalar_tags
     assert "train/masks/all/zero/absolute_error_sum" not in scalar_tags
     assert "train/overall/absolute_error_sum" not in scalar_tags
+    assert "train/overall/original_loss" not in scalar_tags
+    assert "train/overall/total_loss" in scalar_tags
+    assert "validation/overall/total_loss" in scalar_tags
     groups = read_rows(root, "mask_groups.csv")
     assert len(groups) == len(rows) * 15
     with gzip.open(root / "validation_frequency.csv.gz", "rt") as stream:

@@ -141,7 +141,9 @@ validation and test coverage describe their evaluation passes. A count can
 rise simply because more windows were observed, so use `selection_rate` when
 comparing frequencies or passes.
 
-TensorBoard shows one overall series for each diagnostic and six margin
+TensorBoard labels the actual batch-mean optimization objective as
+`train/overall/total_loss` and `validation/overall/total_loss`.
+It shows one overall series for each other diagnostic and six margin
 summaries: three selection-strategy totals and three replacement-action
 totals. Each margin shows count, content count, L1, content L1, and their
 zero-baseline-relative versions. The full nine-cell grid, raw aggregation
