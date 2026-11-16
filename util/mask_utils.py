@@ -170,8 +170,9 @@ def variable_mask_time(
 
     masked_positions = []
     max_window = 2 * max(window_sizes)
+    mask_probability = task_cfg.mask_p
     for pos in valid_starts:
-        if random.random() < task_cfg.mask_p:
+        if random.random() < mask_probability:
             if (
                 len(masked_positions) == 0
                 or abs(masked_positions[-1] - pos) > max_window + 1
@@ -221,8 +222,9 @@ def variable_mask_freq(
     mask_sizes = [max(1, int(4.9 * (f) / 250)) for f in fs]
     idx2mask_size = {i: s for i, s in enumerate(mask_sizes)}
     valid_starts = list(range(data.shape[1] - max(mask_sizes)))
+    mask_probability = task_cfg.mask_p
     masked_positions = [
-        i for i in valid_starts if random.random() < task_cfg.mask_p
+        i for i in valid_starts if random.random() < mask_probability
     ]
 
     masked_data = torch.clone(data)
