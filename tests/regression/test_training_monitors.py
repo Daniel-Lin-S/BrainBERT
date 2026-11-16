@@ -2,6 +2,7 @@
 
 import copy
 import csv
+import gzip
 import json
 import random
 from pathlib import Path
@@ -12,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data import Subset
+from torch.utils.data import DataLoader, Subset
 from tensorboard.backend.event_processing.event_accumulator import (
     EventAccumulator,
 )
@@ -26,6 +27,7 @@ from util.experiments.monitoring import (
     Accumulator,
     TrainingMonitor,
     batch_statistics,
+    embedding_rank,
     summarize,
 )
 from util.mask_utils import fixed_mask_inputs, mask_inputs, variable_mask
@@ -245,16 +247,18 @@ def read_rows(root, name):
 
 
 @pytest.mark.parametrize(
-    "total_steps, log_step, checkpoint_step, expected_steps, "
-    "expected_batches, expected_starts",
+    "total_steps, log_step, checkpoint_step, epoch_end, "
+    "expected_steps, expected_batches, expected_starts",
     [
-        (4, 2, 2, [1, 3, 4], [1, 2, 1], [1, 2, 4]),
-        (5, 3, 2, [1, 3, 4, 5], [1, 2, 1, 1], [1, 2, 4, 5]),
+        (4, 2, 2, False, [1, 3, 4], [1, 2, 1], [1, 2, 4]),
+        (5, 3, 2, False, [1, 3, 4, 5], [1, 2, 1, 1], [1, 2, 4, 5]),
+        (5, 3, 2, True, [1, 2, 3, 4, 5],
+         [1, 1, 1, 1, 1], [1, 2, 3, 4, 5]),
     ],
 )
 def test_training_csv_tensorboard_and_best_checkpoint(
-    tmp_path, total_steps, log_step, checkpoint_step, expected_steps,
-    expected_batches, expected_starts,
+    tmp_path, total_steps, log_step, checkpoint_step, epoch_end,
+    expected_steps, expected_batches, expected_starts,
 ):
     torch.set_num_threads(1)
     task = SpecPretrain(OmegaConf.create({"name": "spec_pretrain"}))
@@ -283,6 +287,7 @@ def test_training_csv_tensorboard_and_best_checkpoint(
             "total_steps": total_steps,
             "log_step": log_step,
             "checkpoint_step": checkpoint_step,
+            "epoch_end_validation": epoch_end,
             "train_batch_size": 1,
             "valid_batch_size": 1,
             "num_workers": 0,
@@ -323,6 +328,22 @@ def test_training_csv_tensorboard_and_best_checkpoint(
     assert all(float(row["relative_l1"]) >= 0 for row in train)
     assert all(float(row["original_relative_l1"]) >= 0 for row in train)
     assert [int(row["interval_start"]) for row in train] == expected_starts
+    if epoch_end:
+        epochs = read_rows(root, "epoch_metrics.csv")
+        assert [int(row["epoch"]) for row in epochs] == [1, 1, 2, 2, 3, 3]
+        assert [int(row["step"]) for row in epochs] == [2, 2, 4, 4, 5, 5]
+        assert [row["complete"] for row in epochs] == [
+            "True", "True", "True", "True", "False", "False"
+        ]
+        assert [int(row["batches"]) for row in epochs] == [
+            2, 1, 2, 1, 1, 1
+        ]
+        assert len(read_rows(root, "epoch_mask_groups.csv")) == (
+            len(epochs) * 15
+        )
+        assert len(read_rows(root, "epoch_frequency_coverage.csv")) == (
+            len(epochs) * 6 * 40
+        )
     checkpoint = torch.load(
         tmp_path / "checkpoints/checkpoint_best.pth", weights_only=False
     )
@@ -346,6 +367,9 @@ def test_training_csv_tensorboard_and_best_checkpoint(
     assert "train/masks/l1" in events.Tags()["images"]
     groups = read_rows(root, "mask_groups.csv")
     assert len(groups) == len(rows) * 15
+    with gzip.open(root / "validation_frequency.csv.gz", "rt") as stream:
+        frequency_rows = list(csv.DictReader(stream))
+    assert len(frequency_rows) == len(validation) * 4 * 40
     coverage = read_rows(root, "frequency_coverage.csv")
     final = [
         r
@@ -395,6 +419,68 @@ def test_completion_integrity_and_legacy_reuse(tmp_path):
                     scientific,
                 ):
                     pass
+
+
+def test_frequency_errors_use_each_bin_own_selected_count():
+    target = torch.tensor([[[2.0, 4.0, 8.0]]])
+    predicted = torch.tensor([[[1.0, 2.0, 4.0]]])
+    provenance = {
+        "selection": torch.tensor([[[1, 2, 3]]], dtype=torch.uint8),
+        "action": torch.ones((1, 1, 3), dtype=torch.uint8),
+    }
+    stats = batch_statistics(
+        predicted, target, torch.ones_like(target),
+        torch.zeros((1, 1), dtype=torch.bool), provenance, 1.0,
+        include_frequency=True,
+    )
+    frequency = stats["frequency"]
+    np.testing.assert_array_equal(frequency[:, :, 0], np.eye(3))
+    np.testing.assert_array_equal(
+        frequency[np.arange(3), np.arange(3), 1], [1, 2, 4]
+    )
+    np.testing.assert_array_equal(
+        frequency[np.arange(3), np.arange(3), 4], [2, 4, 8]
+    )
+
+
+def test_validation_rank_and_frequency_from_one_forward():
+    from models.masked_tf_model import MaskedTFModel
+    from tasks.batch_utils import spec_collator
+
+    cfg = OmegaConf.create({
+        "input_dim": 40, "hidden_dim": 40, "nhead": 4,
+        "layer_dim_feedforward": 80, "layer_activation": "gelu",
+        "encoder_num_layers": 1,
+    })
+    model = MaskedTFModel()
+    model.build_model(cfg)
+    criterion = PretrainMaskedCriterion()
+    criterion.build_criterion(OmegaConf.create({"alpha": 2.0}))
+    task = SpecPretrain(OmegaConf.create({"name": "spec_pretrain"}))
+    loader = DataLoader(
+        [example(), example()], batch_size=2, collate_fn=spec_collator
+    )
+    outs = task.get_valid_outs(
+        model, loader, criterion, "cpu", rank_indices=[0, 1],
+        collect_frequency=True,
+    )
+    assert outs["rank_embeddings"].shape == (2, 40)
+    frequency = outs["monitor_accumulator"].frequency
+    assert frequency.shape == (3, 40, 6)
+    assert int(frequency[:, :, 0].sum()) == int(
+        outs["monitor_accumulator"].sums[:, 0].sum()
+    )
+    assert np.isfinite(frequency).all()
+
+    orthogonal = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
+    rank = embedding_rank(orthogonal)
+    assert rank["effective_rank"] == pytest.approx(2)
+    assert rank["effective_rank_fraction"] == pytest.approx(1)
+    assert rank["pca95_components"] == 2
+    with pytest.warns(UserWarning, match="zero centered variance"):
+        collapsed = embedding_rank(np.ones((4, 2)))
+    assert collapsed["effective_rank"] == 0
+    assert collapsed["pca95_components"] == 0
 
 
 def test_nonfinite_statistics_rejected():

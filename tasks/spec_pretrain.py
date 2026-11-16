@@ -1,4 +1,10 @@
-# python3 run_train.py +exp=spec2vec ++exp.runner.device=cuda ++exp.runner.multi_gpu=True ++exp.runner.num_workers=16 +data=masked_tf_dataset +model=debug_model +data.data=/storage/czw/self_supervised_seeg/all_day_data/manifests ++exp.runner.train_batch_size=64
+"""Build masked-STFT pre-training batches and validation summaries.
+
+Input batches contain one-electrode spectrograms and mask provenance.
+Validation returns original scalar losses and compact scientific statistics;
+optional window embeddings support checkpoint-level rank monitoring.
+"""
+import numpy as np
 import torch
 
 import models
@@ -21,7 +27,32 @@ class SpecPretrain(BaseTask):
     def setup_task(cls, cfg):
         return cls(cfg)
 
-    def get_valid_outs(self, model, valid_loader, criterion, device):
+    def get_valid_outs(
+        self, model, valid_loader, criterion, device,
+        rank_indices=None, collect_frequency=False,
+    ):
+        """Evaluate one pass and optionally collect bounded embeddings.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            Pre-training model producing (B, T, F) predictions.
+        valid_loader : torch.utils.data.DataLoader
+            Fixed validation batches.
+        criterion : torch.nn.Module
+            Original masked reconstruction criterion.
+        device : str
+            Inference device.
+        rank_indices : sequence of int, optional
+            Loader positions to pool into (N, D) embeddings, default None.
+        collect_frequency : bool, optional
+            Collect frequency sufficient statistics, default False.
+
+        Returns
+        -------
+        dict
+            Batch-mean original losses and optional monitor statistics.
+        """
         if len(valid_loader) == 0:
             raise ValueError(
                 "Evaluation loader must contain at least one batch."
@@ -36,9 +67,26 @@ class SpecPretrain(BaseTask):
             "content_zero_baseline_l1": 0,
         }
         monitor = Accumulator()
+        embeddings = []
+        offset = 0
         with torch.no_grad():
             for batch in valid_loader:
-                _, valid_outs = criterion(model, batch, device)
+                size = batch["target"].shape[0]
+                selected = [] if rank_indices is None else [
+                    index - offset for index in rank_indices
+                    if offset <= index < offset + size
+                ]
+                _, valid_outs = criterion(
+                    model, batch, device,
+                    embedding_rows=selected,
+                    collect_frequency=collect_frequency,
+                )
+                if selected:
+                    embeddings.append(
+                        valid_outs.pop("window_embeddings")
+                        .cpu().numpy()
+                    )
+                offset += size
                 if "monitor_statistics" in valid_outs:
                     monitor.add(valid_outs)
                 all_outs["loss"] += valid_outs["loss"]
@@ -53,6 +101,12 @@ class SpecPretrain(BaseTask):
                 ]
         for key in all_outs:
             all_outs[key] /= len(valid_loader)
+        if rank_indices is not None:
+            if len(rank_indices) != sum(len(x) for x in embeddings):
+                raise ValueError("Validation embedding subset is incomplete.")
+            all_outs["rank_embeddings"] = (
+                np.concatenate(embeddings) if embeddings else None
+            )
         if monitor.batches:
             if monitor.batches != len(valid_loader):
                 raise ValueError(

@@ -10,6 +10,7 @@ loss. A negative checkpoint interval disables disk saves, not model selection.
 import copy
 import logging
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +23,9 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from schedulers import build_scheduler
 from util.experiments.monitoring import Accumulator, TrainingMonitor
-from util.experiments.storage import atomic_write
+from util.experiments.storage import atomic_write, write_json
+
+RANK_SAMPLE_WINDOWS = 2048
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +65,7 @@ class Runner:
         self.output_tb = cfg.get("output_tb", True)
         self.logger = None
         self.monitor = None
+        self.rank_indices = None
         self.best_step = None
         if self.output_tb and task.cfg.name != "spec_pretrain":
             self.logger = SummaryWriter(
@@ -184,6 +188,11 @@ class Runner:
             shuffle=False,
             num_workers=self.cfg.num_workers,
         )
+        if self.monitor is not None:
+            return self.task.get_valid_outs(
+                self.model, valid_loader, self.criterion, self.device,
+                rank_indices=self.rank_indices, collect_frequency=True,
+            )
         valid_logging_outs = self.task.get_valid_outs(
             self.model, valid_loader, self.criterion, self.device
         )
@@ -226,7 +235,7 @@ class Runner:
 
     def run_epoch(self, train_loader, total_loss, best_state):
         best_model, best_val = best_state
-        for batch in train_loader:
+        for batch_index, batch in enumerate(train_loader):
             if self.progress.n >= self.progress.total:
                 break
             self.model.train()
@@ -243,6 +252,9 @@ class Runner:
             self.completed_steps += 1
             if self.monitor is not None:
                 self.monitor.train.add(logging_out, self.cfg.grad_clip)
+                self.monitor.epoch_train.add(
+                    logging_out, self.cfg.grad_clip
+                )
             total_loss.append(logging_out["loss"])
             log_step = (
                 self.progress.n % self.cfg.log_step == 0
@@ -256,6 +268,14 @@ class Runner:
                     or self.progress.n == self.progress.total - 1
                 )
 
+            epoch_end = (
+                self.cfg.get("epoch_end_validation", False)
+                and (
+                    batch_index == len(train_loader) - 1
+                    or self.progress.n == self.progress.total - 1
+                )
+            )
+            ckpt_step = ckpt_step or epoch_end
             valid_logging_outs = {}
             saved_best = False
             if ckpt_step or log_step:
@@ -263,11 +283,15 @@ class Runner:
                 valid_logging_outs = self.get_valid_outs()
                 if self.monitor is not None:
                     stats = valid_logging_outs.pop("monitor_accumulator")
+                    rank = valid_logging_outs.pop(
+                        "rank_embeddings", None
+                    )
                     self.monitor.record(
                         "train",
                         self.completed_steps,
                         self.monitor.train,
                         learning_rates=learning_rates,
+                        plot_images=epoch_end or self.completed_steps == 1,
                     )
                     self.monitor.train = Accumulator()
                     self.monitor.record(
@@ -275,7 +299,21 @@ class Runner:
                         self.completed_steps,
                         stats,
                         checkpoint_step=self.completed_steps,
+                        plot_images=epoch_end or self.completed_steps == 1,
                     )
+                    self.monitor.record_frequency(
+                        self.completed_steps, stats,
+                        plot_image=epoch_end,
+                    )
+                    if rank is not None:
+                        self.monitor.record_rank(
+                            self.completed_steps, rank
+                        )
+                    if epoch_end:
+                        self.monitor.record_epoch(
+                            self.epoch_index, self.completed_steps,
+                            stats, batch_index == len(train_loader) - 1,
+                        )
                 val_loss = valid_logging_outs["loss"]
                 if not np.isfinite(val_loss):
                     raise ValueError("Validation loss must be finite.")
@@ -297,7 +335,10 @@ class Runner:
                 logging_out["loss"] = np.mean(total_loss)
                 self.output_logs(logging_out, valid_logging_outs)
                 total_loss = []
-            if ckpt_step and not saved_best:
+            if (
+                ckpt_step and self.cfg.checkpoint_step > -1
+                and not saved_best
+            ):
                 self.save_checkpoints()
             if self.progress.disable:
                 self.progress.n += 1
@@ -319,6 +360,21 @@ class Runner:
                 raise ValueError(
                     "Training and validation monitors require the same "
                     "source dataset and STFT preprocessing settings."
+                )
+            windows = len(self.task.valid_set)
+            if windows < 2:
+                warnings.warn(
+                    "Validation embedding rank requires at least two windows."
+                )
+            else:
+                self.rank_indices = np.unique(np.linspace(
+                    0, windows - 1, min(RANK_SAMPLE_WINDOWS, windows),
+                    dtype=int,
+                ))
+                write_json(
+                    self.monitor.root / "rank_subset.json",
+                    {"validation_windows": windows,
+                     "positions": self.rank_indices.tolist()},
                 )
         train_loader = self.get_batch_iterator(
             self.task.train_set,
@@ -343,7 +399,9 @@ class Runner:
         with logging_redirect_tqdm():
             if self.cfg.checkpoint_step > -1:
                 self.save_checkpoints()
+            self.epoch_index = 0
             while self.progress.n < self.progress.total:
+                self.epoch_index += 1
                 total_loss, best_state = self.run_epoch(
                     train_loader, total_loss, best_state
                 )

@@ -11,12 +11,15 @@ records normalization and categorical semantics; no spectrograms are saved.
 """
 
 import csv
+import gzip
+import warnings
 import os
 from pathlib import Path
 
 import numpy as np
 import torch
 from tensorboardX import SummaryWriter
+from threadpoolctl import threadpool_limits
 
 from .storage import write_json
 
@@ -60,6 +63,7 @@ def batch_statistics(
     padding: torch.Tensor,
     provenance: dict,
     threshold: float,
+    include_frequency: bool = False,
 ) -> dict:
     """Reduce valid selected cells without retaining an autograd graph.
 
@@ -73,12 +77,15 @@ def batch_statistics(
         uint8 selection and final-action arrays of shape (B, T, F).
     threshold : float
         Original absolute-target content threshold.
+    include_frequency : bool, optional
+        Collect (strategy, frequency, statistic) sums, default False.
 
     Returns
     -------
     dict
         Float64 (9, 10) sufficient statistics, int64 (3, F) counts,
-        and int64 (F,) valid-cell exposures, on the CPU.
+        and int64 (F,) valid-cell exposures, on the CPU. Optional
+        frequency sums have shape (3, F, 6).
     """
     selection = provenance["selection"].to(output.device)
     action = provenance["action"].to(output.device)
@@ -130,11 +137,28 @@ def batch_statistics(
             for code in range(1, len(STRATEGIES) + 1)
         ]
     )
-    return {
+    result = {
         "sums": sums.cpu().numpy(),
         "coverage": coverage.cpu().numpy(),
         "exposure": valid.sum(dim=(0, 1)).cpu().numpy(),
     }
+    if include_frequency:
+        bins = selected.nonzero(as_tuple=True)[2]
+        frequencies = target.shape[2]
+        group = (selection[selected].long() - 1) * frequencies + bins
+        values = torch.stack(
+            (torch.ones_like(y), error, content.double(),
+             error * content, y.abs(), y.abs() * content), dim=1
+        )
+        frequency = torch.zeros(
+            (len(STRATEGIES) * frequencies, 6),
+            dtype=torch.float64, device=output.device,
+        )
+        frequency.index_add_(0, group, values)
+        result["frequency"] = frequency.reshape(
+            len(STRATEGIES), frequencies, 6
+        ).cpu().numpy()
+    return result
 
 
 class Accumulator:
@@ -144,6 +168,7 @@ class Accumulator:
         self.sums = np.zeros((GROUPS, len(SUM_FIELDS)), dtype=np.float64)
         self.coverage = None
         self.exposure = None
+        self.frequency = None
         self.batches = 0
         self.original = dict.fromkeys(ORIGINAL_METRICS, 0.0)
         self.gradient_sum = 0.0
@@ -162,6 +187,11 @@ class Accumulator:
                 raise ValueError("Frequency count changed within a pass.")
             self.coverage += stats["coverage"]
             self.exposure += stats["exposure"]
+        if "frequency" in stats:
+            if self.frequency is None:
+                self.frequency = stats["frequency"].copy()
+            else:
+                self.frequency += stats["frequency"]
         self.batches += 1
         for key in ORIGINAL_METRICS:
             self.original[key] += outs[key]
@@ -196,6 +226,73 @@ def summarize(sums: np.ndarray, alpha: float) -> dict:
         variance = max(0.0, sums[i + 1] / n - mean**2) if n else None
         result[f"{name}_std"] = np.sqrt(variance) if n else None
     return result
+
+
+def summarize_accumulator(
+    accumulator: Accumulator, alpha: float, training: bool,
+) -> dict:
+    """Summarize original and pooled losses over one nonempty pass."""
+    if not accumulator.batches:
+        raise ValueError("Cannot summarize an empty monitoring pass.")
+    result = summarize(accumulator.sums.sum(axis=0), alpha)
+    result.update({
+        f"original_{name}": value / accumulator.batches
+        for name, value in accumulator.original.items()
+    })
+    baseline = accumulator.original["zero_baseline_l1"]
+    content_base = accumulator.original["content_zero_baseline_l1"]
+    result["original_relative_l1"] = (
+        accumulator.original["l1_loss"] / baseline
+        if baseline > 0 else None
+    )
+    result["original_relative_content_l1"] = (
+        accumulator.original["content_l1"] / content_base
+        if content_base > 0 else None
+    )
+    result["batches"] = accumulator.batches
+    result["gradient_norm_mean"] = (
+        accumulator.gradient_sum / accumulator.batches
+        if training else None
+    )
+    result["gradient_norm_max"] = (
+        accumulator.gradient_max if training else None
+    )
+    result["clipping_fraction"] = (
+        accumulator.clipped / accumulator.batches if training else None
+    )
+    return result
+
+
+def embedding_rank(embeddings: np.ndarray) -> dict:
+    """Measure diversity of centered validation window embeddings (N, D)."""
+    values = np.asarray(embeddings, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] < 2:
+        raise ValueError("Effective rank requires at least two windows.")
+    if not np.isfinite(values).all():
+        raise ValueError("Validation embeddings must be finite.")
+    centered = values - values.mean(axis=0)
+    with threadpool_limits(limits=1):
+        covariance = centered.T @ centered / (len(values) - 1)
+        eigenvalues = np.clip(np.linalg.eigvalsh(covariance), 0, None)[::-1]
+    total = eigenvalues.sum()
+    maximum = min(len(values) - 1, values.shape[1])
+    if total == 0:
+        warnings.warn("Validation embeddings have zero centered variance.")
+        effective = 0.0
+        pca95 = 0
+    else:
+        probability = eigenvalues[eigenvalues > 0] / total
+        effective = float(np.exp(-np.sum(probability * np.log(probability))))
+        pca95 = int(np.searchsorted(
+            np.cumsum(eigenvalues), 0.95 * total
+        ) + 1)
+    return {
+        "windows": len(values),
+        "embedding_dim": values.shape[1],
+        "effective_rank": effective,
+        "effective_rank_fraction": effective / maximum,
+        "pca95_components": pca95,
+    }
 
 
 class TrainingMonitor:
@@ -251,6 +348,7 @@ class TrainingMonitor:
         self.streams = {}
         self.writers = {}
         self.train = Accumulator()
+        self.epoch_train = Accumulator()
         self.start_step = 1
         self.cumulative_coverage = np.zeros(
             (len(STRATEGIES), len(frequencies)), dtype=np.int64
@@ -261,7 +359,7 @@ class TrainingMonitor:
         write_json(
             self.root / "metadata.json",
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "frequency_hz": self.frequencies.tolist(),
                 "strategies": list(STRATEGIES),
                 "actions": list(ACTIONS),
@@ -293,7 +391,11 @@ class TrainingMonitor:
     def _row(self, table: str, row: dict, tag: str | None = None) -> None:
         """Append a row and mirror numeric measurements to TensorBoard."""
         if table not in self.writers:
-            stream = (self.root / f"{table}.csv").open("x", newline="")
+            stream = (
+                gzip.open(self.root / f"{table}.csv.gz", "xt", newline="")
+                if table == "validation_frequency"
+                else (self.root / f"{table}.csv").open("x", newline="")
+            )
             self.streams[table] = stream
             self.writers[table] = csv.DictWriter(stream, fieldnames=list(row))
             self.writers[table].writeheader()
@@ -321,6 +423,7 @@ class TrainingMonitor:
         accumulator: Accumulator,
         checkpoint_step: int | None = None,
         learning_rates: list | None = None,
+        plot_images: bool = True,
     ) -> None:
         """Write one training interval or evaluation pass.
 
@@ -360,42 +463,8 @@ class TrainingMonitor:
             "interval_end": step,
             "checkpoint_step": checkpoint_step,
         }
-        overall = summarize(accumulator.sums.sum(axis=0), self.alpha)
-        overall.update(
-            {
-                f"original_{k}": v / accumulator.batches
-                for k, v in accumulator.original.items()
-            }
-        )
-        baseline = accumulator.original["zero_baseline_l1"]
-        content_baseline = accumulator.original["content_zero_baseline_l1"]
-        overall["original_relative_l1"] = (
-            accumulator.original["l1_loss"] / baseline
-            if baseline > 0
-            else None
-        )
-        overall["original_relative_content_l1"] = (
-            accumulator.original["content_l1"] / content_baseline
-            if content_baseline > 0
-            else None
-        )
-        overall["batches"] = accumulator.batches
-        overall.update(
-            {
-                "gradient_norm_mean": (
-                    accumulator.gradient_sum / accumulator.batches
-                    if phase == "train"
-                    else None
-                ),
-                "gradient_norm_max": (
-                    accumulator.gradient_max if phase == "train" else None
-                ),
-                "clipping_fraction": (
-                    accumulator.clipped / accumulator.batches
-                    if phase == "train"
-                    else None
-                ),
-            }
+        overall = summarize_accumulator(
+            accumulator, self.alpha, phase == "train"
         )
         # Group count stays fixed for a run; evaluations use empty LR fields.
         for i in range(self.lr_groups):
@@ -413,7 +482,8 @@ class TrainingMonitor:
         for j, action in enumerate(ACTIONS):
             self._group(context, "all", action, grid[:, j].sum(axis=0))
         self._coverage(
-            context, "interval", accumulator.coverage, accumulator.exposure
+            context, "interval", accumulator.coverage, accumulator.exposure,
+            plot_images=plot_images,
         )
         if phase == "train":
             self.cumulative_coverage += accumulator.coverage
@@ -423,25 +493,190 @@ class TrainingMonitor:
                 "cumulative",
                 self.cumulative_coverage,
                 self.cumulative_exposure,
+                plot_images=plot_images,
             )
             self.start_step = step + 1
-        if self.writer is not None:
+        if self.writer is not None and plot_images:
             self._heatmap(context, grid)
         self.flush()
 
+    def record_rank(self, step: int, embeddings: np.ndarray) -> None:
+        """Save centered window-embedding rank at one validation update."""
+        summary = embedding_rank(embeddings)
+        self._row("validation_rank", {"step": step, **summary})
+        if self.writer is not None:
+            for name in (
+                "effective_rank", "effective_rank_fraction",
+                "pca95_components",
+            ):
+                self.writer.add_scalar(
+                    f"validation/rank/{name}", summary[name], step
+                )
+        self.flush()
+
+    def record_frequency(
+        self, step: int, stats: Accumulator, plot_image: bool = False
+    ) -> None:
+        """Save validation reconstruction by STFT bin and mask strategy."""
+        if stats.frequency is None:
+            raise ValueError("Validation frequency statistics are missing.")
+        pooled = stats.frequency.sum(axis=0)
+        groups = [("all", pooled)] + list(zip(
+            STRATEGIES, stats.frequency
+        ))
+        for strategy, bins in groups:
+            for frequency_hz, values in zip(self.frequencies, bins):
+                count, error, content, content_error, baseline, content_base = (
+                    values
+                )
+                self._row("validation_frequency", {
+                    "step": step,
+                    "frequency_hz": frequency_hz,
+                    "strategy": strategy,
+                    "selected_cells": int(count),
+                    "content_cells": int(content),
+                    "l1": error / count if count else None,
+                    "content_l1": (
+                        content_error / content if content else None
+                    ),
+                    "zero_baseline_l1": (
+                        baseline / count if count else None
+                    ),
+                    "relative_l1": (
+                        error / baseline if baseline > 0 else None
+                    ),
+                    "relative_content_l1": (
+                        content_error / content_base
+                        if content_base > 0 else None
+                    ),
+                })
+        if self.writer is not None:
+            selected = pooled[:, 0] > 0
+            ratios = pooled[:, 4] > 0
+            if np.any(selected):
+                self.writer.add_histogram(
+                    "validation/frequency/l1",
+                    pooled[selected, 1] / pooled[selected, 0], step,
+                )
+            if np.any(ratios):
+                self.writer.add_histogram(
+                    "validation/frequency/relative_l1",
+                    pooled[ratios, 1] / pooled[ratios, 4], step,
+                )
+        if self.writer is not None and plot_image:
+            self._frequency_reconstruction_plot(step, pooled)
+        self.flush()
+
+    def _frequency_reconstruction_plot(
+        self, step: int, pooled: np.ndarray
+    ) -> None:
+        """Plot validation L1 and baseline ratio at actual STFT bins."""
+        import textwrap
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        observed = pooled[:, 0] > 0
+        baseline = pooled[:, 4] > 0
+        if not np.any(observed):
+            return
+        with sns.axes_style("whitegrid"), sns.plotting_context("talk"):
+            fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+            sns.lineplot(
+                x=self.frequencies[observed],
+                y=pooled[observed, 1] / pooled[observed, 0],
+                ax=axes[0], linewidth=2.5,
+            )
+            if np.any(baseline):
+                sns.lineplot(
+                    x=self.frequencies[baseline],
+                    y=pooled[baseline, 1] / pooled[baseline, 4],
+                    ax=axes[1], linewidth=2.5,
+                )
+            axes[1].axhline(1, color="gray", linestyle="--")
+            axes[0].set_ylabel("L1 (standardized magnitude)")
+            axes[1].set_ylabel("L1 / zero baseline")
+            axes[1].set_xlabel("Frequency (Hz)")
+            axes[1].set_xlim(
+                self.frequencies[0], self.frequencies[-1]
+            )
+            axes[0].set_ylim(bottom=0)
+            axes[1].set_ylim(bottom=0)
+            fig.suptitle(textwrap.fill(
+                "Validation masked reconstruction across frequency", 50
+            ), y=0.99)
+            fig.tight_layout(rect=(0, 0, 1, 0.94))
+            self.writer.add_figure(
+                "validation/frequency/reconstruction", fig, step
+            )
+            plt.close(fig)
+
+    def record_epoch(
+        self, epoch: int, step: int, validation: Accumulator,
+        complete: bool,
+    ) -> None:
+        """Save online training and final-snapshot validation summaries."""
+        for phase, stats in (
+            ("train_online", self.epoch_train),
+            ("validation", validation),
+        ):
+            if not stats.batches:
+                raise ValueError(f"Epoch {epoch} {phase} has no batches.")
+            context = {
+                "epoch": epoch, "step": step, "phase": phase,
+                "complete": complete,
+            }
+            summary = summarize_accumulator(
+                stats, self.alpha, phase == "train_online"
+            )
+            self._row("epoch_metrics", {**context, **summary})
+            grid = stats.sums.reshape(
+                len(STRATEGIES), len(ACTIONS), len(SUM_FIELDS)
+            )
+            for i, strategy in enumerate(STRATEGIES):
+                for j, action in enumerate(ACTIONS):
+                    self._group(
+                        context, strategy, action, grid[i, j],
+                        table="epoch_mask_groups",
+                    )
+                self._group(
+                    context, strategy, "all", grid[i].sum(axis=0),
+                    table="epoch_mask_groups",
+                )
+            for j, action in enumerate(ACTIONS):
+                self._group(
+                    context, "all", action, grid[:, j].sum(axis=0),
+                    table="epoch_mask_groups",
+                )
+            self._coverage(
+                context, "epoch", stats.coverage, stats.exposure,
+                plot_images=False, table="epoch_frequency_coverage",
+            )
+            if self.writer is not None:
+                self.writer.add_scalar(
+                    f"epoch/{phase}/original_loss",
+                    summary["original_loss"], epoch,
+                )
+                self.writer.add_scalar(
+                    f"epoch/{phase}/l1", summary["l1"], epoch,
+                )
+        self.epoch_train = Accumulator()
+        self.flush()
+
     def _group(
-        self, context: dict, strategy: str, action: str, sums: np.ndarray
+        self, context: dict, strategy: str, action: str, sums: np.ndarray,
+        table: str = "mask_groups",
     ) -> None:
         """Write a conditional group without rescaling its denominator."""
         self._row(
-            "mask_groups",
+            table,
             {
                 **context,
                 "strategy": strategy,
                 "action": action,
                 **summarize(sums, self.alpha),
             },
-            f"masks/{strategy}/{action}",
+            f"masks/{strategy}/{action}"
+            if table == "mask_groups" else None,
         )
 
     def _coverage(
@@ -450,6 +685,8 @@ class TrainingMonitor:
         scope: str,
         counts: np.ndarray,
         exposure: np.ndarray,
+        plot_images: bool = True,
+        table: str = "frequency_coverage",
     ) -> None:
         """Save frequency counts and rates; plot the actual Hz axis."""
         series = dict(zip(STRATEGIES, counts))
@@ -463,7 +700,7 @@ class TrainingMonitor:
         for name, selected in series.items():
             for i, hz in enumerate(self.frequencies):
                 self._row(
-                    "frequency_coverage",
+                    table,
                     {
                         **context,
                         "scope": scope,
@@ -476,7 +713,7 @@ class TrainingMonitor:
                         ),
                     },
                 )
-        if self.writer is not None:
+        if self.writer is not None and plot_images:
             self._frequency_plot(context, scope, series, exposure)
 
     def _frequency_plot(

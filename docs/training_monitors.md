@@ -5,15 +5,47 @@ values below refer to the preprocessed spectrogram, so their units follow the
 configured STFT normalization rather than the raw signal voltage. Training and
 validation diagnostics are recorded at the same completed-update steps.
 Training summaries cover batches since the preceding evaluation step;
-validation summaries cover the current evaluation pass. These are update-based
-measurements, not full training epochs. The test pass uses the checkpoint
-selected by validation loss.
+validation summaries cover the current evaluation pass. Epoch summaries cover
+all training batches in one data pass and validation at its final checkpoint.
+The test pass uses the checkpoint selected by validation loss.
 
 With the default recording-wise STFT z-score, both phases use deviations
 from an electrode and frequency mean as their scale. Each recording fits
 its own moments from eligible windows in its assigned split, so one
 normalized unit can represent a different raw magnitude across
 recordings. The monitor metadata identifies the normalization mode.
+
+## Epoch summaries and representation diversity
+
+`epoch_metrics.csv`, `epoch_mask_groups.csv`, and
+`epoch_frequency_coverage.csv` summarize the same diagnostics across a
+complete data pass (or a marked partial final pass). Training values are
+online averages from weights changing during that pass. Validation values
+use the single checkpoint at its end; their difference is therefore not a
+same-checkpoint generalization gap.
+
+`validation_rank.csv` uses a fixed, evenly spaced subset of validation
+windows at every evaluation. It averages non-padding frames of the final
+transformer layer for each window, centers those vectors, and reports:
+
+| Diagnostic | Calculation | Scientific meaning |
+| --- | --- | --- |
+| `effective_rank` | Exponential entropy of normalized covariance eigenvalues | Number of comparably active embedding directions. |
+| `effective_rank_fraction` | Effective rank divided by `min(windows - 1, hidden size)` | Diversity relative to the attainable rank. |
+| `pca95_components` | Smallest number of principal components explaining at least 95% of variance | A complementary threshold-based dimension count. |
+
+These embeddings come from the same masked inputs used for validation
+reconstruction. A zero-variance embedding set has rank zero.
+
+## Per-frequency validation reconstruction
+
+`validation_frequency.csv.gz` reports each STFT frequency separately for
+all selected validation cells and for temporal-only, spectral-only, and
+overlap selections. Each row provides selected and content-cell counts,
+mean L1, content L1, and L1 relative to the zero-prediction baseline.
+All values use the existing validation masks and forward pass. Their
+frequency-dependent masking difficulty remains visible through the
+selection groups and counts; they are not isolated single-frequency probes.
 
 ## Training objective
 

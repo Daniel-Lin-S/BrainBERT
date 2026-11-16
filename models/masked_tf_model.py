@@ -1,3 +1,10 @@
+"""Encode masked STFT windows and predict their unmasked magnitudes.
+
+Inputs have shape (batch, frames, frequencies). Outputs contain predicted
+magnitudes and positional encodings; validation may also request final-layer
+embeddings with shape (batch, frames, hidden dimension).
+"""
+
 import json
 
 import numpy as np
@@ -21,7 +28,29 @@ class MaskedTFModel(BaseModel):
         src_key_mask,
         intermediate_rep=False,
         rep_from_layer=-1,
+        return_hidden=False,
     ):
+        """Predict STFT magnitudes and optionally expose final embeddings.
+
+        Parameters
+        ----------
+        input_specs : torch.Tensor
+            Masked spectra, shape (B, T, F).
+        src_key_mask : torch.Tensor
+            Padding mask, shape (B, T).
+        intermediate_rep : bool, optional
+            Return only final hidden states, default False.
+        rep_from_layer : int, optional
+            Reserved layer index, default -1.
+        return_hidden : bool, optional
+            Include final states with predictions, default False.
+
+        Returns
+        -------
+        tuple or torch.Tensor
+            Predictions (B, T, F) and positional encodings, optionally
+            followed by final states (B, T, D).
+        """
         input_specs, pos_enc = self.input_encoding(input_specs)
         input_specs = input_specs.transpose(
             0, 1
@@ -35,7 +64,10 @@ class MaskedTFModel(BaseModel):
         output_specs = output_specs.transpose(0, 1)  # [batch, seq, dim]
         if intermediate_rep:
             return output_specs
-        output_specs = self.spec_prediction_head(output_specs)
+        hidden = output_specs
+        output_specs = self.spec_prediction_head(hidden)
+        if return_hidden:
+            return output_specs, pos_enc, hidden
         return output_specs, pos_enc
 
     def set_stft_statistics(self, statistics: dict) -> None:

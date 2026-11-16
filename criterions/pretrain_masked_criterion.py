@@ -26,14 +26,43 @@ class PretrainMaskedCriterion(BaseCriterion):
     def build_criterion(self, cfg):
         self.cfg = cfg
 
-    def forward(self, model, batch, device):
+    def forward(
+        self, model, batch, device, embedding_rows=None,
+        collect_frequency=False,
+    ):
+        """Compute the unchanged masked-cell objective and diagnostics.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            Model predicting spectra of shape (B, T, F).
+        batch : dict
+            Masked inputs, targets and masks of shape (B, T, F).
+        device : str
+            Training or evaluation device.
+        embedding_rows : sequence of int, optional
+            Batch rows to pool into (N, D) final embeddings, default None.
+        collect_frequency : bool, optional
+            Collect validation frequency sums, default False.
+
+        Returns
+        -------
+        tuple
+            Original scalar loss and detached diagnostic values.
+        """
         # x = batch[:,:10] #potentially don't move to device if dataparallel
         pad_mask = batch["attn_mask"].to(device)
         masked_input = batch["masked_input"].to(
             device
         )  # potentially don't move to device if dataparallel
         mask = batch["mask_label"].bool().to(device)
-        output, pos_enc = model.forward(masked_input, pad_mask)
+        result = model.forward(
+            masked_input, pad_mask, return_hidden=True
+        ) if embedding_rows else model.forward(masked_input, pad_mask)
+        if embedding_rows:
+            output, pos_enc, hidden = result
+        else:
+            output, pos_enc = result
         labels = batch["target"].to(device)
         true_activity = labels.masked_select(mask)
         predicted = output.masked_select(mask)
@@ -76,6 +105,16 @@ class PretrainMaskedCriterion(BaseCriterion):
             ),
             "content_aware_loss": content_aware_loss.item(),
         }
+        if embedding_rows:
+            sampled_hidden = hidden[embedding_rows].detach()
+            sampled_padding = pad_mask[embedding_rows]
+            valid = (~sampled_padding).unsqueeze(-1)
+            lengths = valid.sum(dim=1)
+            if (lengths <= 0).any():
+                raise ValueError("Embedding pooling needs valid frames.")
+            logging_output["window_embeddings"] = (
+                (sampled_hidden * valid).sum(dim=1) / lengths
+            )
         if "mask_provenance" in batch:
             logging_output["monitor_statistics"] = batch_statistics(
                 output,
@@ -84,5 +123,6 @@ class PretrainMaskedCriterion(BaseCriterion):
                 pad_mask,
                 batch["mask_provenance"],
                 CONTENT_THRESHOLD,
+                include_frequency=collect_frequency,
             )
         return loss, logging_output

@@ -10,6 +10,7 @@ psutil
 tensorboardX
 git+https://github.com/ildoonet/pytorch-gradual-warmup-lr.git
 scikit-learn
+threadpoolctl
 tensorboard
 torch_optimizer
 tables
