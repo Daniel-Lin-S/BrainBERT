@@ -18,7 +18,11 @@ def prepare_example(
     statistics=None,
 ):
     """Apply one-sample trimming, STFT, and masking to one electrode."""
-    wav = wav.astype("float32")[:-1]
+    if wav is None:
+        if features is None:
+            raise ValueError("A waveform or cached features are required.")
+    else:
+        wav = wav.astype("float32")[:-1]
     data = (
         extracter(wav, statistics=statistics) if features is None else features
     )

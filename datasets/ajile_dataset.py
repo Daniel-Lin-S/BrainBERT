@@ -96,6 +96,7 @@ class AJILE12(Dataset):
         self.selection = None
         self.selected_train = False
         self.selected_statistics = {}
+        self.session_indices = {}
         self.eval_indices = set()
         self.session_partition = {
             session: name
@@ -275,8 +276,12 @@ class AJILE12(Dataset):
         session = bisect_right(self.ends, index)
         record = self.records[session]
         if self.active != session:
-            self.valid = eligibility(self.audit, record)
-            self.positions = np.flatnonzero(self.valid)
+            if session not in self.session_indices:
+                valid = eligibility(self.audit, record)
+                self.session_indices[session] = (
+                    valid, np.flatnonzero(valid)
+                )
+            self.valid, self.positions = self.session_indices[session]
             if len(self.positions) != record["eligible"]:
                 raise ValueError("AJILE eligibility index count differs.")
             self.statistics = None
@@ -300,13 +305,7 @@ class AJILE12(Dataset):
         window, channel = divmod(
             int(self.positions[local]), record["metadata"]["channels"]
         )
-        wav = waveform(
-            Path(self.root_dir) / record["source"],
-            record["metadata"],
-            window,
-            channel,
-            self.valid,
-        )
+        wav = None
         if self.selection is not None and (
             self.selected_train or index in self.eval_indices
         ):
@@ -337,6 +336,10 @@ class AJILE12(Dataset):
                 )
             finally:
                 random.setstate(state)
+        wav = waveform(
+            Path(self.root_dir) / record["source"],
+            record["metadata"], window, channel, self.valid,
+        )
         statistics = None
         if self.extracter.cfg.normalizing == "dataset_zscore":
             shared = self.prepare_statistics()

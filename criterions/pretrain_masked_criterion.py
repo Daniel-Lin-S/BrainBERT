@@ -92,8 +92,9 @@ class PretrainMaskedCriterion(BaseCriterion):
             "ground_truth": labels[0].detach().cpu(),
             "pred_spectrogram": output_log_spec,
             "pos_enc": pos_enc[0].detach().cpu(),
-            "wav": wav,
         }
+        if wav is not None:
+            images["wav"] = wav
         logging_output = {
             "loss": loss.item(),
             "images": images,
