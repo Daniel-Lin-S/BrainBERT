@@ -1,0 +1,7 @@
+# AJILE pre-training inherits the original optimizer and batching settings.
+defaults:
+  - spec2vec
+  - _self_
+runner:
+  total_steps: null
+  epochs: 32

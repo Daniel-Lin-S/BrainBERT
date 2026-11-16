@@ -27,6 +27,8 @@ SCIENTIFIC_RUNNER = {
     "valid_batch_size",
     "shuffle",
     "total_steps",
+    "epochs",
+    "epoch_end_validation",
     "grad_clip",
     "scheduler",
     "log_step",
@@ -47,6 +49,7 @@ DATA_PLACEMENT = {
     "cached_features",
     "feature_cache",
     "pinned_test",
+    "pinned_evaluation",
     "audit",
 }
 
@@ -78,7 +81,10 @@ def scientific_config(cfg: object, dataset: object, splits: dict) -> dict:
         "data": {k: v for k, v in data.items() if k not in DATA_PLACEMENT},
         "inventory": dataset.inventory,
         "splits": splits,
-        "runner": {k: v for k, v in runner.items() if k in SCIENTIFIC_RUNNER},
+        "runner": {
+            k: v for k, v in runner.items()
+            if k in SCIENTIFIC_RUNNER and k != "epochs"
+        },
     }
     if hasattr(dataset, "selection_manifest"):
         result["selection"] = digest(

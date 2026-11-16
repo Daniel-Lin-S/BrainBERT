@@ -106,6 +106,46 @@ def selection_path(
     return root / namespace / "selections" / f"{digest(identity)}.json"
 
 
+def load_pinned_evaluation(path: Path, dataset: object) -> dict:
+    """Verify fixed evaluation windows against audited source splits.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        JSON with source content IDs and validation/test global indices.
+    dataset : object
+        Dataset exposing ordered records, cumulative ends and partitions.
+
+    Returns
+    -------
+    dict
+        Verified pinned evaluation membership.
+    """
+    from bisect import bisect_right
+
+    pinned = json.loads(path.expanduser().resolve().read_text())
+    expected = {
+        record["session"]: record["content_id"]
+        for record in dataset.records
+    }
+    if pinned.get("content_ids") != expected:
+        raise ValueError("Pinned evaluation source identities differ.")
+    if set(pinned.get("indices", {})) != {"validation", "test"}:
+        raise ValueError("Pinned evaluation needs validation and test lists.")
+    for phase in ("validation", "test"):
+        indices = pinned["indices"][phase]
+        if not indices or len(indices) != len(set(indices)):
+            raise ValueError(f"Pinned {phase} windows are empty or repeated.")
+        allowed = set(dataset.partitions[phase])
+        for index in indices:
+            if not isinstance(index, int) or not 0 <= index < len(dataset):
+                raise ValueError(f"Pinned {phase} index is out of range.")
+            record = dataset.records[bisect_right(dataset.ends, index)]
+            if record["session"] not in allowed:
+                raise ValueError(f"Pinned {phase} window is outside split.")
+    return pinned
+
+
 def select_or_load(root: Path, dataset: object, settings: dict) -> dict:
     """Freeze cache-aware indices across models and cache growth.
 

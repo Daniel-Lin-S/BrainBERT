@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from util.experiments.sampling import (
-    allocate, select_group, select_or_load
+    allocate, load_pinned_evaluation, select_group, select_or_load
 )
 from util.experiments.storage import digest
 
@@ -257,7 +257,8 @@ def main() -> None:
     parser.add_argument("--feature-cache", required=True, type=Path)
     parser.add_argument("--artifact-root", required=True, type=Path)
     parser.add_argument("--preprocessor", required=True, type=Path)
-    parser.add_argument("--sample-budget", required=True, type=int)
+    parser.add_argument("--sample-budget", type=int)
+    parser.add_argument("--pinned-evaluation", type=Path)
     parser.add_argument(
         "--validation-batches", type=int,
         default=DEFAULT_EVAL_BATCHES,
@@ -285,6 +286,10 @@ def main() -> None:
         "audit": str(args.audit.resolve()),
     })
     dataset = AJILE12(data_cfg, preprocessor_cfg=preprocessor)
+    if args.sample_budget is None and args.pinned_evaluation is None:
+        raise ValueError(
+            "Full-data preparation requires --pinned-evaluation."
+        )
     settings = {
         "mode": "temperature",
         "sample_budget": args.sample_budget,
@@ -294,7 +299,20 @@ def main() -> None:
         "test_batches": args.test_batches,
         "valid_batch_size": args.valid_batch_size,
     }
-    selected = select_or_load(args.artifact_root, dataset, settings)
+    pinned = (
+        load_pinned_evaluation(args.pinned_evaluation, dataset)
+        if args.pinned_evaluation is not None else None
+    )
+    if args.sample_budget is None:
+        selected = {"indices": {"train": [], **pinned["indices"]}}
+    else:
+        selected = select_or_load(args.artifact_root, dataset, settings)
+        if pinned is not None:
+            for phase in ("validation", "test"):
+                if selected["indices"][phase] != pinned["indices"][phase]:
+                    raise ValueError(
+                        f"Selected {phase} windows differ from pin."
+                    )
     dataset.configure_selection(selected)
     if args.max_examples is not None:
         if args.max_examples <= 0:

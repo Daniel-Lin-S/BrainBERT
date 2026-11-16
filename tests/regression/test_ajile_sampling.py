@@ -5,16 +5,26 @@ import pytest
 from omegaconf import OmegaConf
 
 
-def test_budget_overrides_configured_steps(tmp_path, monkeypatch) -> None:
-    """Warn and derive runner and scheduler steps from sample budget."""
-    from util.experiments.execution import configure_budgeted
+def test_budget_and_epoch_duration_are_independent(tmp_path, monkeypatch):
+    """Resolve either run length after freezing AJILE membership."""
+    import json
+    from torch.utils.data import Subset
+
+    from util.experiments.execution import (
+        configure_budgeted, resolve_training_steps,
+    )
 
     class Dataset:
         selection_namespace = "test"
         selection_revision = "test-v1"
-        records = []
-        partitions = {}
-        ends = []
+        records = [
+            {"session": phase, "content_id": phase, "eligible": 3}
+            for phase in ("train", "validation", "test")
+        ]
+        partitions = {
+            phase: [phase] for phase in ("train", "validation", "test")
+        }
+        ends = [3, 6, 9]
         inventory = []
 
         def group_id(self, record: dict) -> str:
@@ -27,7 +37,7 @@ def test_budget_overrides_configured_steps(tmp_path, monkeypatch) -> None:
             return {}
 
         def __len__(self) -> int:
-            return 3
+            return 9
 
         def __getitem__(self, index: int) -> int:
             return index
@@ -36,39 +46,88 @@ def test_budget_overrides_configured_steps(tmp_path, monkeypatch) -> None:
             self.selection = selection
 
     class Task:
-        dataset = Dataset()
+        def __init__(self):
+            self.dataset = Dataset()
+            self.train_set = Subset(self.dataset, [0, 1, 2])
 
+    pinned = tmp_path / "evaluation.json"
+    pinned.write_text(json.dumps({
+        "content_ids": {
+            phase: phase for phase in ("train", "validation", "test")
+        },
+        "indices": {"validation": [3], "test": [6]},
+    }))
     cfg = OmegaConf.create({
         "task": {"sampling": {
-            "mode": "temperature",
-            "sample_budget": 682000,
-            "alpha": 0,
-            "seed": 0,
-            "validation_batches": 128,
-            "test_batches": 128,
+            "mode": "temperature", "sample_budget": 2,
+            "alpha": 0, "seed": 0,
+            "validation_batches": 1, "test_batches": 1,
         }},
-        "data": {"name": "ajile12"},
-        "preprocessor": {"normalizing": "recording_zscore"},
+        "data": {"pinned_evaluation": str(pinned)},
         "storage": {"artifacts": str(tmp_path)},
         "exp": {"runner": {
-            "train_batch_size": 256,
-            "valid_batch_size": 256,
-            "shuffle": False,
-            "total_steps": 400000,
+            "train_batch_size": 2, "valid_batch_size": 1,
+            "shuffle": False, "total_steps": 5,
             "scheduler": {"name": "ramp_up"},
         }},
     })
     selection = {"indices": {
-        "train": [0], "validation": [1], "test": [2],
+        "train": [0, 1], "validation": [3], "test": [6],
     }}
     monkeypatch.setattr(
         "util.experiments.sampling.select_or_load",
         lambda root, dataset, settings: selection,
     )
-    with pytest.warns(UserWarning, match="total_steps is ignored"):
-        configure_budgeted(cfg, Task())
-    assert cfg.exp.runner.total_steps == 2665
-    assert cfg.exp.runner.scheduler.total_steps == 2665
+    budgeted = Task()
+    configure_budgeted(cfg, budgeted)
+    resolve_training_steps(cfg, budgeted)
+    assert len(budgeted.train_set) == 2
+    assert cfg.exp.runner.total_steps == 5
+    assert cfg.exp.runner.scheduler.total_steps == 5
+
+    cfg.task.sampling.pop("sample_budget")
+    cfg.exp.runner.total_steps = None
+    cfg.exp.runner.epochs = 2
+    full = Task()
+    configure_budgeted(cfg, full)
+    resolve_training_steps(cfg, full)
+    assert len(full.train_set) == 3
+    assert cfg.exp.runner.total_steps == 4
+    assert cfg.exp.runner.scheduler.total_steps == 4
+
+
+def test_equivalent_duration_and_pin_paths_share_fit_identity() -> None:
+    """Hash resolved science, not duration syntax or local placement."""
+    from types import SimpleNamespace
+
+    from util.experiments.lifecycle import scientific_config
+
+    cfg = OmegaConf.create({
+        "exp": {"runner": {
+            "total_steps": 10, "epochs": None,
+            "epoch_end_validation": True,
+        }},
+        "protocol": {"revision": "epoch-v1"},
+        "model": {"name": "masked_tf_model"},
+        "task": {"name": "spec_pretrain"},
+        "criterion": {"alpha": 2.0},
+        "preprocessor": {"name": "stft"},
+        "data": {
+            "name": "ajile12", "pinned_evaluation": "/tmp/first.json",
+        },
+    })
+    dataset = SimpleNamespace(
+        inventory=[{"session": "source", "content_id": "digest"}],
+        selection_manifest={
+            "indices": {"train": [], "validation": [1], "test": [2]}
+        },
+    )
+    splits = {"train": ["a"], "validation": ["b"], "test": ["c"]}
+    first = scientific_config(cfg, dataset, splits)
+    cfg.exp.runner.epochs = 5
+    cfg.data.pinned_evaluation = "/tmp/other.json"
+    second = scientific_config(cfg, dataset, splits)
+    assert first == second
 
 
 def test_ajile_evaluation_balances_electrodes(tmp_path) -> None:

@@ -12,7 +12,6 @@ import math
 import os
 import subprocess
 import sys
-import warnings
 from pathlib import Path
 
 import torch
@@ -81,45 +80,87 @@ def configure_budgeted(cfg: object, task: object) -> None:
             f"Temperature sampling needs subgroup membership: "
             f"{missing}"
         )
-    from util.experiments.sampling import select_or_load
+    from util.experiments.sampling import (
+        load_pinned_evaluation, select_or_load,
+    )
 
     if hasattr(task.dataset, "validate_budgeted_preprocessing"):
         task.dataset.validate_budgeted_preprocessing()
-    budget = int(sampling.sample_budget)
-    if budget <= 0:
-        raise ValueError("sample_budget must be positive.")
-    batch_size = int(cfg.exp.runner.train_batch_size)
-    if batch_size <= 0:
-        raise ValueError("train_batch_size must be positive.")
-    steps = math.ceil(budget / batch_size)
+    budget = sampling.get("sample_budget")
+    if budget is not None and (
+        not isinstance(budget, int) or isinstance(budget, bool)
+        or budget <= 0
+    ):
+        raise ValueError("sample_budget must be a positive integer.")
     if cfg.exp.runner.shuffle:
         raise ValueError(
             "Budgeted sampling requires runner.shuffle=False."
         )
-    if (
-        "total_steps" in cfg.exp.runner
-        or "total_steps" in cfg.exp.runner.scheduler
-    ):
-        warnings.warn(
-            "total_steps is ignored when sample_budget is set.",
-            stacklevel=2,
-        )
-    with open_dict(cfg):
-        cfg.task.sampling.alpha = float(sampling.alpha)
-        cfg.exp.runner.total_steps = steps
-        cfg.exp.runner.scheduler.total_steps = steps
-    settings = OmegaConf.to_container(sampling, resolve=True)
-    settings["valid_batch_size"] = int(cfg.exp.runner.valid_batch_size)
-    selected = select_or_load(
-        Path(cfg.storage.artifacts).resolve(), task.dataset, settings
+    pinned = load_pinned_evaluation(
+        Path(cfg.data.pinned_evaluation), task.dataset
     )
+    for phase in ("validation", "test"):
+        expected = (
+            sampling[f"{phase}_batches"] * cfg.exp.runner.valid_batch_size
+        )
+        if len(pinned["indices"][phase]) != expected:
+            raise ValueError(
+                f"Pinned {phase} has {len(pinned['indices'][phase])} "
+                f"windows, expected {expected}."
+            )
+    if budget is None:
+        selected = {"indices": {"train": [], **pinned["indices"]}}
+    else:
+        settings = OmegaConf.to_container(sampling, resolve=True)
+        settings["valid_batch_size"] = int(cfg.exp.runner.valid_batch_size)
+        selected = select_or_load(
+            Path(cfg.storage.artifacts).resolve(), task.dataset, settings
+        )
+        for phase in ("validation", "test"):
+            if selected["indices"][phase] != pinned["indices"][phase]:
+                raise ValueError(
+                    f"Selected {phase} windows differ from pinned windows."
+                )
     task.dataset.configure_selection(selected)
-    task.train_set = Subset(task.dataset, selected["indices"]["train"])
+    if budget is not None:
+        task.train_set = Subset(task.dataset, selected["indices"]["train"])
     task.valid_set = Subset(
         task.dataset, selected["indices"]["validation"]
     )
     task.test_set = Subset(task.dataset, selected["indices"]["test"])
     task.dataset.selection_manifest = selected
+
+
+def resolve_training_steps(cfg: object, task: object) -> None:
+    """Resolve the scientific duration from steps or data passes.
+
+    Parameters
+    ----------
+    cfg : object
+        Managed configuration containing one duration and batch size.
+    task : object
+        Task with frozen training membership.
+    """
+    runner = cfg.exp.runner
+    epochs = runner.get("epochs")
+    steps = runner.get("total_steps")
+    if (epochs is None) == (steps is None):
+        raise ValueError("Set exactly one of epochs or total_steps.")
+    if (not isinstance(runner.train_batch_size, int)
+            or runner.train_batch_size <= 0):
+        raise ValueError("train_batch_size must be a positive integer.")
+    if len(task.train_set) <= 0:
+        raise ValueError("Training selection must be nonempty.")
+    if epochs is not None:
+        if not isinstance(epochs, int) or epochs <= 0:
+            raise ValueError("epochs must be a positive integer.")
+        per_epoch = math.ceil(len(task.train_set) / runner.train_batch_size)
+        steps = int(epochs) * per_epoch
+    if not isinstance(steps, int) or steps <= 0:
+        raise ValueError("total_steps must be a positive integer.")
+    with open_dict(cfg):
+        runner.total_steps = int(steps)
+        runner.scheduler.total_steps = int(steps)
 
 
 def execute(cfg: object) -> dict:
@@ -189,6 +230,7 @@ def execute(cfg: object) -> dict:
                 f"Test split differs from pinned samples: {pinned_path}"
             )
     configure_budgeted(cfg, task)
+    resolve_training_steps(cfg, task)
     scientific = scientific_config(cfg, task.dataset, splits)
     with FitRun(
         cfg.storage.artifacts, cfg.storage.logs, cfg.campaign, scientific

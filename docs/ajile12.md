@@ -68,24 +68,25 @@ and `--normalizing dataset_zscore`.
 
 ## Budgeted pre-training
 
-Use `+task=ajile12_pretrain +exp=ajile12_budget` with the existing AJILE
-dataset and local storage overlay. The task configuration sets a total
-`sample_budget` of 682,000 draws, equal session probability (`alpha: 0`),
-and 128 validation and 128 test batches. These values are editable scientific
-settings. The runner derives its step count from the draw budget and batch
-size. A supplied `total_steps` is ignored with a warning.
+Use `+task=ajile12_pretrain +exp=ajile12` with the existing AJILE
+dataset and local storage overlay. The tracked AJILE experiment trains on
+all eligible training windows for 32 full epochs. The ignored local pilot
+overlay inherits these settings and selects 682,000 training windows for
+five epochs. An experiment sets either `epochs` or `total_steps`; epoch
+length is `ceil(training windows / training batch size)` optimizer updates.
+The original `spec2vec` configuration retains 400,000 total updates.
 
-A shared selection manifest freezes the eligible train, validation, and test
-examples before preprocessing. Within each session, selection uses compatible
-raw STFT cache entries first and draws uncached examples for the remaining
-quota. Increasing a budget can reuse cached examples and add new windows;
-a smaller budget subsamples cached examples. Evaluation selections balance
-electrodes within each session and fix masks per example. Selected raw STFTs
-and per-session frequency moments are cached separately so later budgets
-can reuse spectral extraction while fitting their own moments.
+The full run uses compact recording spans rather than a materialized list
+of all training indices. The pilot retains its frozen training selection.
+Both runs use the same pinned validation and test windows and fixed masks
+per evaluation window. Selected raw STFTs and evaluation moments are cached
+for reuse; the full training set uses recording moments from eligible
+training windows.
 
 Run `python -m data.ajile.sampling --help` for the preprocessing command.
-Pass the local source, audit, cache, artifact, and STFT configuration paths.
-The command prepares the selected training, validation, and test examples
-without starting model training; `--workers` controls independent session
-preparation.
+Pass the local source, audit, cache, artifact, pinned-evaluation, and STFT
+configuration paths. For the full run, omit `--sample-budget`: the command
+prepares only the fixed evaluation windows; recording-wise training moments
+can be prepared with `data.ajile.normalization`. For the pilot, pass
+`--sample-budget 682000` to prepare its frozen training selection too.
+`--workers` controls independent session preparation.

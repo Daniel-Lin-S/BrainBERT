@@ -231,6 +231,17 @@ def test_ajile_dataset_applies_cached_recording_statistics(tmp_path):
     np.testing.assert_array_equal(
         first_eval["mask_label"], second_eval["mask_label"]
     )
+    dataset.configure_selection({
+        "indices": {"train": [], "validation": [3], "test": []}
+    })
+    dataset.active = None
+    full_train = dataset[0]
+    assert dataset.selected_train is False
+    assert dataset.statistics["count"].tolist() == [372, 372]
+    assert full_train["target"].shape == (186, 40)
+    np.testing.assert_array_equal(
+        dataset[3]["mask_label"], first_eval["mask_label"]
+    )
 
 
 def test_dataset_moments_are_electrode_specific_and_train_only(tmp_path):

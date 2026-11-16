@@ -93,6 +93,7 @@ class AJILE12(Dataset):
         self.dataset_statistics = None
         self.key_to_index = None
         self.selection = None
+        self.selected_train = False
         self.selected_statistics = {}
         self.eval_indices = set()
         self.session_partition = {
@@ -213,6 +214,7 @@ class AJILE12(Dataset):
     def configure_selection(self, selection: dict) -> None:
         """Attach frozen indices and evaluation mask membership."""
         self.selection = selection["indices"]
+        self.selected_train = bool(self.selection["train"])
         self.eval_indices = set(
             self.selection["validation"] + self.selection["test"]
         )
@@ -273,8 +275,14 @@ class AJILE12(Dataset):
             if len(self.positions) != record["eligible"]:
                 raise ValueError("AJILE eligibility index count differs.")
             self.statistics = None
-            if (self.selection is None and
-                    self.extracter.cfg.normalizing == "recording_zscore"):
+            full_train = (
+                not self.selected_train
+                and record["session"] in self.partitions["train"]
+            )
+            if (
+                self.extracter.cfg.normalizing == "recording_zscore"
+                and (self.selection is None or full_train)
+            ):
                 self.statistics = recording_statistics(
                     Path(self.root_dir),
                     record,
@@ -294,7 +302,9 @@ class AJILE12(Dataset):
             channel,
             self.valid,
         )
-        if self.selection is not None:
+        if self.selection is not None and (
+            self.selected_train or index in self.eval_indices
+        ):
             raw = self.raw_spectrum(index, wav)
             moments = self.selected_statistics.get(record["session"])
             if moments is None:
