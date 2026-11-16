@@ -32,6 +32,35 @@ STATUS_STEP_INTERVAL = 10
 log = logging.getLogger(__name__)
 
 
+def restore_cuda_rng(states: list[torch.Tensor]) -> None:
+    """Restore checkpoint random streams to the currently visible GPUs.
+
+    Parameters
+    ----------
+    states : list of torch.Tensor
+        One one-dimensional byte tensor per checkpoint CUDA device, ordered
+        by logical device index. CPU RNG restoration must precede this call.
+
+    Notes
+    -----
+    Newly visible devices start from the restored CPU generator's seed.
+    Matching logical devices retain their saved streams. Changing device
+    count cannot reproduce the original dropout draws exactly.
+    """
+    if not states:
+        raise ValueError("Checkpoint CUDA random-state list is empty.")
+    devices = torch.cuda.device_count()
+    if len(states) != devices:
+        warnings.warn(
+            f"Checkpoint has {len(states)} CUDA random streams, but "
+            f"{devices} devices are visible; restoring matching streams "
+            "and seeding new devices. Stochastic replay will differ.",
+            RuntimeWarning, stacklevel=2,
+        )
+        torch.cuda.manual_seed_all(torch.initial_seed())
+    torch.cuda.set_rng_state_all([state.cpu() for state in states[:devices]])
+
+
 class Runner:
     def __init__(self, cfg, task, model, criterion):
         self.cfg = cfg
@@ -150,9 +179,7 @@ class Runner:
         np.random.set_state(last["numpy_rng"])
         torch.set_rng_state(last["torch_rng"].cpu())
         if torch.cuda.is_available() and "cuda_rng" in last:
-            torch.cuda.set_rng_state_all(
-                [state.cpu() for state in last["cuda_rng"]]
-            )
+            restore_cuda_rng(last["cuda_rng"])
 
     def _init_optim(self, args):
         if args.optim == "SGD":

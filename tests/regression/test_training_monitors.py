@@ -20,7 +20,7 @@ from tensorboard.backend.event_processing.event_accumulator import (
 
 from criterions.pretrain_masked_criterion import PretrainMaskedCriterion
 from preprocessors import STFTPreprocessor
-from runner import Runner
+from runner import Runner, restore_cuda_rng
 from tasks.spec_pretrain import SpecPretrain
 from util.experiments.lifecycle import FitRun
 from util.experiments.monitoring import (
@@ -33,6 +33,34 @@ from util.experiments.monitoring import (
 from util.mask_utils import fixed_mask_inputs, mask_inputs, variable_mask
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("saved,visible", [(1, 4), (4, 1), (4, 4)])
+def test_cuda_rng_restoration_across_device_counts(saved, visible):
+    """Changed GPU counts keep available streams without invalid devices."""
+    states = [torch.tensor([i], dtype=torch.uint8) for i in range(saved)]
+    with (
+        patch("torch.cuda.device_count", return_value=visible),
+        patch("torch.cuda.manual_seed_all") as seed,
+        patch("torch.cuda.set_rng_state_all") as restore,
+    ):
+        if saved != visible:
+            with pytest.warns(RuntimeWarning, match="Stochastic replay"):
+                restore_cuda_rng(states)
+            seed.assert_called_once_with(torch.initial_seed())
+        else:
+            restore_cuda_rng(states)
+            seed.assert_not_called()
+    actual = restore.call_args.args[0]
+    assert len(actual) == min(saved, visible)
+    for expected, restored in zip(states, actual):
+        assert torch.equal(expected, restored)
+
+
+def test_cuda_rng_restoration_rejects_empty_checkpoint():
+    """An empty CUDA state must not silently reset a resumed experiment."""
+    with pytest.raises(ValueError, match="random-state list is empty"):
+        restore_cuda_rng([])
 
 
 def test_status_groups_progress_by_stage(tmp_path):
