@@ -34,8 +34,9 @@ not a repository-wide source hash.
 
 The pinned test JSON is a nonempty list of manifest-relative sample names;
 current generated test membership must match exactly. Training and validation
-membership is recorded but need not be separately pinned. No new production
-split or data selection is created automatically.
+membership is recorded but need not be separately pinned. The existing step-based workflow creates no new production split or data
+selection. AJILE budgeted selection is documented in
+[AJILE-12 pre-training](ajile12.md).
 
 STFT caching stores finite unmasked tensors beneath the configured cache root,
 keyed by waveform content, preprocessing settings and cache revision. Existing

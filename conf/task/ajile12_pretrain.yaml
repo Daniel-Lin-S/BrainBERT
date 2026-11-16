@@ -1,0 +1,13 @@
+name: spec_pretrain
+mask_type: variable
+max_f: 250
+min_f: 0.01
+mask_p: 0.10
+n_freq_steps: 40
+sampling:
+    mode: temperature
+    sample_budget: 682000
+    alpha: 0
+    seed: 0
+    validation_batches: 128
+    test_batches: 128

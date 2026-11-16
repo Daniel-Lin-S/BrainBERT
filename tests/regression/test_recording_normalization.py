@@ -1,6 +1,7 @@
 """Verify split-local recording normalization on synthetic AJILE windows."""
 
 import json
+import random
 from pathlib import Path
 from unittest.mock import patch
 
@@ -185,6 +186,21 @@ def test_ajile_dataset_applies_cached_recording_statistics(tmp_path):
     assert first["mask_label"].shape == first["target"].shape
     another = dataset[3]
     assert another["target"].shape == first["target"].shape
+    dataset.configure_selection({
+        "indices": {"train": [0], "validation": [3], "test": []}
+    })
+    dataset.selected_statistics = {session: stats}
+    random.seed(31)
+    before_train = random.getstate()
+    dataset[0]
+    assert random.getstate() != before_train
+    before_eval = random.getstate()
+    first_eval = dataset[3]
+    second_eval = dataset[3]
+    assert random.getstate() == before_eval
+    np.testing.assert_array_equal(
+        first_eval["mask_label"], second_eval["mask_label"]
+    )
 
 
 def test_dataset_moments_are_electrode_specific_and_train_only(tmp_path):

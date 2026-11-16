@@ -16,6 +16,11 @@ def main(cfg: DictConfig) -> None:
 
         execute(cfg)
         return
+    if cfg.task.get("sampling") is not None:
+        raise ValueError(
+            "Budgeted sampling requires managed storage and a "
+            "frozen selection manifest."
+        )
     import tasks
     from runner import Runner
 

@@ -8,13 +8,16 @@ absolute source placement and software versions are provenance only.
 
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf, open_dict
+from torch.utils.data import Subset
 
 from .lifecycle import OPERATIONAL_RUNNER, FitRun, scientific_config
 from .storage import file_digest, write_json
@@ -54,6 +57,69 @@ def source_inventory(dataset: object) -> list:
             )
         inventory.append({"sample": name, "sha256": file_digest(path)})
     return inventory
+
+
+def configure_budgeted(cfg: object, task: object) -> None:
+    """Freeze optional group sampling and derive training steps."""
+    sampling = cfg.task.get("sampling")
+    if sampling is None:
+        return
+    if sampling.mode != "temperature":
+        raise ValueError(f"Unknown sampling mode: {sampling.mode}")
+    required = (
+        "records", "partitions", "ends", "inventory",
+        "cached_local_indices", "cache_settings",
+        "configure_selection", "group_id",
+        "selection_namespace", "selection_revision",
+    )
+    missing = [
+        name for name in required
+        if not hasattr(task.dataset, name)
+    ]
+    if missing:
+        raise ValueError(
+            f"Temperature sampling needs subgroup membership: "
+            f"{missing}"
+        )
+    from util.experiments.sampling import select_or_load
+
+    if hasattr(task.dataset, "validate_budgeted_preprocessing"):
+        task.dataset.validate_budgeted_preprocessing()
+    budget = int(sampling.sample_budget)
+    if budget <= 0:
+        raise ValueError("sample_budget must be positive.")
+    batch_size = int(cfg.exp.runner.train_batch_size)
+    if batch_size <= 0:
+        raise ValueError("train_batch_size must be positive.")
+    steps = math.ceil(budget / batch_size)
+    if cfg.exp.runner.shuffle:
+        raise ValueError(
+            "Budgeted sampling requires runner.shuffle=False."
+        )
+    if (
+        "total_steps" in cfg.exp.runner
+        or "total_steps" in cfg.exp.runner.scheduler
+    ):
+        warnings.warn(
+            "total_steps is ignored when sample_budget is set.",
+            stacklevel=2,
+        )
+    with open_dict(cfg):
+        cfg.task.sampling.alpha = float(sampling.alpha)
+        cfg.exp.runner.total_steps = steps
+        cfg.exp.runner.scheduler.total_steps = steps
+    settings = OmegaConf.to_container(sampling, resolve=True)
+    settings["valid_batch_size"] = int(cfg.exp.runner.valid_batch_size)
+    selected = select_or_load(
+        Path(cfg.storage.artifacts).resolve(), task.dataset, settings
+    )
+    task.dataset.configure_selection(selected)
+    task.train_set = Subset(task.dataset, selected["indices"]["train"])
+    task.valid_set = Subset(
+        task.dataset, selected["indices"]["validation"]
+    )
+    task.test_set = Subset(task.dataset, selected["indices"]["test"])
+    task.dataset.selection_manifest = selected
 
 
 def execute(cfg: object) -> dict:
@@ -122,6 +188,7 @@ def execute(cfg: object) -> dict:
             raise ValueError(
                 f"Test split differs from pinned samples: {pinned_path}"
             )
+    configure_budgeted(cfg, task)
     scientific = scientific_config(cfg, task.dataset, splits)
     with FitRun(
         cfg.storage.artifacts, cfg.storage.logs, cfg.campaign, scientific
@@ -146,6 +213,13 @@ def execute(cfg: object) -> dict:
             cfg.exp.runner.artifact_dir = str(run.path / "checkpoints")
         runner = None
         try:
+            if (
+                hasattr(task.dataset, "selection_manifest")
+                and hasattr(task.dataset, "prepare_selected")
+            ):
+                task.dataset.prepare_selected(
+                    task.dataset.selection_manifest
+                )
             model = task.build_model(cfg.model)
             criterion = task.build_criterion(cfg.criterion)
             runner = Runner(cfg.exp.runner, task, model, criterion)

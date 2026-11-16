@@ -7,10 +7,12 @@ and audit paths are local settings, not scientific identity.
 """
 
 import json
+import random
 from bisect import bisect_right
 from pathlib import Path
 
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 
 from data.ajile.core import POLICY, waveform
@@ -22,6 +24,15 @@ from data.ajile.normalization import (
 from datasets import register_dataset
 from datasets.masked_tf_dataset import prepare_example
 from preprocessors import STFTPreprocessor
+from preprocessors.cache import (
+    cached_raw_positions, cached_raw_stft
+)
+from util.experiments.storage import digest
+
+
+RAW_STFT_NAMESPACE = "ajile_raw_stft"
+SELECTION_NAMESPACE = "ajile12"
+SELECTION_REVISION = "ajile-budgeted-v2"
 
 
 class SessionIndices:
@@ -47,6 +58,9 @@ class SessionIndices:
 @register_dataset(name="ajile12")
 class AJILE12(Dataset):
     """Load an eligible electrode window without materializing waveforms."""
+
+    selection_namespace = SELECTION_NAMESPACE
+    selection_revision = SELECTION_REVISION
 
     def __init__(
         self,
@@ -78,6 +92,9 @@ class AJILE12(Dataset):
         self.statistics = None
         self.dataset_statistics = None
         self.key_to_index = None
+        self.selection = None
+        self.selected_statistics = {}
+        self.eval_indices = set()
         self.session_partition = {
             session: name
             for name, sessions in self.partitions.items()
@@ -137,6 +154,98 @@ class AJILE12(Dataset):
             }
         return self.dataset_statistics
 
+
+    def group_id(self, record: dict) -> str:
+        """Return the audited session identity of one record."""
+        return record["session"]
+
+    def cache_settings(self) -> dict:
+        """Return spectral settings without local cache placement."""
+        settings = dict(self.extracter.cfg)
+        settings.pop("feature_cache", None)
+        return settings
+
+    def cached_local_indices(self, record: dict) -> set[int]:
+        """Find eligible examples with raw STFT cache entries."""
+        root = Path(self.extracter.cfg.feature_cache).resolve()
+        cached_positions = cached_raw_positions(
+            root, RAW_STFT_NAMESPACE, record["content_id"],
+            self.extracter.cfg,
+        )
+        if not cached_positions:
+            return set()
+        valid = eligibility(self.audit, record)
+        lookup = {
+            int(position): index
+            for index, position in enumerate(np.flatnonzero(valid))
+        }
+        invalid = cached_positions - lookup.keys()
+        if invalid:
+            raise ValueError(
+                f"AJILE cache has {len(invalid)} ineligible positions "
+                f"for session {record['session']}."
+            )
+        return {lookup[position] for position in cached_positions}
+
+    def select_evaluation_group(
+        self, record: dict, quota: int, cached: set[int], rng: object
+    ) -> list[int]:
+        """Balance selected eligible examples across electrodes."""
+        from data.ajile.sampling import select_evaluation_group
+
+        return select_evaluation_group(
+            self, record, quota, cached, rng
+        )
+
+    def validate_budgeted_preprocessing(self) -> None:
+        """Require selected recording moments for AJILE budgeted fits."""
+        if self.extracter.cfg.normalizing != "recording_zscore":
+            raise ValueError(
+                "AJILE budgeted fitting requires recording_zscore."
+            )
+
+    def prepare_selected(self, selection: dict) -> dict:
+        """Prepare selected raw spectra and AJILE recording moments."""
+        from data.ajile.sampling import prepare_selected
+
+        return prepare_selected(self, selection)
+
+    def configure_selection(self, selection: dict) -> None:
+        """Attach frozen indices and evaluation mask membership."""
+        self.selection = selection["indices"]
+        self.eval_indices = set(
+            self.selection["validation"] + self.selection["test"]
+        )
+
+    def raw_spectrum(
+        self, index: int, wav: np.ndarray = None
+    ) -> torch.Tensor:
+        """Load or extract one raw STFT, shape (frames, frequencies)."""
+        session = bisect_right(self.ends, index)
+        record = self.records[session]
+        valid = (self.valid if self.active == session
+                 else eligibility(self.audit, record))
+        positions = (self.positions if self.active == session
+                     else np.flatnonzero(valid))
+        local = index - (self.ends[session - 1] if session else 0)
+        position = int(positions[local])
+        window, channel = divmod(
+            position, record["metadata"]["channels"]
+        )
+
+        def extract() -> torch.Tensor:
+            source = Path(self.root_dir) / record["source"]
+            signal = wav if wav is not None else waveform(
+                source, record["metadata"], window, channel, valid
+            )
+            return self.extracter.unnormalized(signal[:-1])
+
+        return cached_raw_stft(
+            Path(self.extracter.cfg.feature_cache).resolve(),
+            RAW_STFT_NAMESPACE, record["content_id"],
+            position, self.extracter.cfg, extract,
+        )
+
     def get_input_dim(self) -> int:
         return self.extracter.cfg.freq_channel_cutoff
 
@@ -164,7 +273,8 @@ class AJILE12(Dataset):
             if len(self.positions) != record["eligible"]:
                 raise ValueError("AJILE eligibility index count differs.")
             self.statistics = None
-            if self.extracter.cfg.normalizing == "recording_zscore":
+            if (self.selection is None and
+                    self.extracter.cfg.normalizing == "recording_zscore"):
                 self.statistics = recording_statistics(
                     Path(self.root_dir),
                     record,
@@ -184,6 +294,34 @@ class AJILE12(Dataset):
             channel,
             self.valid,
         )
+        if self.selection is not None:
+            raw = self.raw_spectrum(index, wav)
+            moments = self.selected_statistics.get(record["session"])
+            if moments is None:
+                raise ValueError(
+                    f"Missing selected AJILE moments: {record['session']}"
+                )
+            values = (
+                raw.double().numpy() - moments["mean"][channel]
+            ) / moments["std"][channel]
+            if not np.isfinite(values).all():
+                raise ValueError("Selected AJILE STFT is nonfinite.")
+            feature = torch.from_numpy(values.astype(np.float32))
+            if index not in self.eval_indices:
+                return prepare_example(
+                    wav, self.extracter, self.task_cfg, features=feature
+                )
+            state = random.getstate()
+            random.seed(digest({
+                "index": index,
+                "source": record["content_id"],
+            }))
+            try:
+                return prepare_example(
+                    wav, self.extracter, self.task_cfg, features=feature
+                )
+            finally:
+                random.setstate(state)
         statistics = None
         if self.extracter.cfg.normalizing == "dataset_zscore":
             shared = self.prepare_statistics()

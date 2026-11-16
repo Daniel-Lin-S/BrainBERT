@@ -63,7 +63,7 @@ def scientific_config(cfg: object, dataset: object, splits: dict) -> dict:
         model["upstream_checkpoint_sha256"] = file_digest(
             Path(model.pop("upstream_ckpt")).expanduser().resolve()
         )
-    return {
+    result = {
         "protocol": OmegaConf.to_container(cfg.protocol, resolve=True),
         "model": model,
         "task": OmegaConf.to_container(cfg.task, resolve=True),
@@ -80,6 +80,11 @@ def scientific_config(cfg: object, dataset: object, splits: dict) -> dict:
         "splits": splits,
         "runner": {k: v for k, v in runner.items() if k in SCIENTIFIC_RUNNER},
     }
+    if hasattr(dataset, "selection_manifest"):
+        result["selection"] = digest(
+            dataset.selection_manifest["indices"]
+        )
+    return result
 
 
 class FitRun:
