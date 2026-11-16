@@ -1,8 +1,8 @@
 # AJILE-12 pre-training data
 
-Use the existing pre-training experiment with `+data=ajile12`. Dataset source,
-audit directory, and pinned test path are local settings. Storage continues to
-use the shared machine configuration.
+Use `+data=ajile12.local +machine=machine.local` for the local AJILE
+source, pinned evaluation, and shared storage settings. The local dataset
+overlay inherits the tracked `data/ajile12.yaml` configuration.
 
 The adapter preserves the released 60 Hz harmonic notch filtering and
 within-group median reference, documented in the
@@ -13,7 +13,8 @@ Five-second native windows map to 10240 samples before the existing
 BrainBERT one-sample trim, STFT and masking. Valid neighboring windows supply
 resampling context; excluded spans are never used as context.
 
-Run the full audit with `python -m data.ajile.audit --config CONFIG`.
+Run the full audit with `python -m data.ajile.audit --config
+conf/data_prep/ajile_audit.local.yaml`.
 It scans every sample, stores resumable reason masks in per-session blocks,
 and excludes bad electrodes, any blocklist overlap, nonfinite and exactly
 constant electrode windows. Incomplete trailing samples are counted and
@@ -70,9 +71,9 @@ and `--normalizing dataset_zscore`.
 
 Use `+task=ajile12_pretrain +exp=ajile12` with the existing AJILE
 dataset and local storage overlay. The tracked AJILE experiment trains on
-all eligible training windows for 32 full epochs. The ignored local pilot
-overlay inherits these settings and selects 682,000 training windows for
-five epochs. An experiment sets either `epochs` or `total_steps`; epoch
+all eligible training windows for 32 full epochs. The ignored local pilot selects `+task=ajile12_pilot.local` and
+`+exp=ajile12_pilot.local`. These group overlays inherit the tracked AJILE
+settings and select 682,000 training windows for five epochs. An experiment sets either `epochs` or `total_steps`; epoch
 length is `ceil(training windows / training batch size)` optimizer updates.
 The original `spec2vec` configuration retains 400,000 total updates.
 

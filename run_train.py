@@ -1,4 +1,4 @@
-"""Train BrainBERT with Hydra; add +local=machine.local for managed fits.
+"""Train BrainBERT with Hydra; add +machine=machine.local for managed fits.
 
 Managed local configuration supplies storage roots and explicit scientific
 settings. Legacy group-only invocations retain the original task interface.

@@ -1,8 +1,8 @@
 # Experiment artifacts and logging
 
 Keep the existing experiment configuration (`+exp=spec2vec` for pre-training)
-and scientific groups. Add `+local=machine.local` to use the ignored shared
-`conf/local/machine.local.yaml` overlay. It contains only machine storage,
+and scientific groups. Add `+machine=machine.local` to use the ignored shared
+`conf/machine/machine.local.yaml` overlay. It contains only machine storage,
 logging, and runtime settings, shared by pre-training and fine-tuning.
 Campaign name, protocol revision, data manifest and pinned test file are
 separate experiment inputs. Supply them explicitly with `+campaign=NAME`,
