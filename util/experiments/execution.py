@@ -259,8 +259,19 @@ def execute(cfg: object) -> dict:
                 hasattr(task.dataset, "selection_manifest")
                 and hasattr(task.dataset, "prepare_selected")
             ):
+                def report_preparation(completed, total):
+                    run.status(
+                        "preprocessing", completed=completed,
+                        total=total, unit="sessions",
+                        completed_steps=0,
+                        total_steps=cfg.exp.runner.total_steps,
+                        epoch=0,
+                        total_epochs=cfg.exp.runner.get("epochs"),
+                    )
+
                 task.dataset.prepare_selected(
-                    task.dataset.selection_manifest
+                    task.dataset.selection_manifest,
+                    progress_callback=report_preparation,
                 )
             model = task.build_model(cfg.model)
             criterion = task.build_criterion(cfg.criterion)

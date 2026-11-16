@@ -205,11 +205,15 @@ class AJILE12(Dataset):
                 "AJILE budgeted fitting requires recording_zscore."
             )
 
-    def prepare_selected(self, selection: dict) -> dict:
+    def prepare_selected(
+        self, selection: dict, progress_callback=None
+    ) -> dict:
         """Prepare selected raw spectra and AJILE recording moments."""
         from data.ajile.sampling import prepare_selected
 
-        return prepare_selected(self, selection)
+        return prepare_selected(
+            self, selection, progress_callback=progress_callback
+        )
 
     def configure_selection(self, selection: dict) -> None:
         """Attach frozen indices and evaluation mask membership."""

@@ -26,6 +26,7 @@ from util.experiments.monitoring import Accumulator, TrainingMonitor
 from util.experiments.storage import atomic_write, write_json
 
 RANK_SAMPLE_WINDOWS = 2048
+STATUS_STEP_INTERVAL = 10
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +182,31 @@ class Runner:
             train_logging_outs, val_logging_outs, self.logger, global_step
         )
 
+    def report_progress(
+        self, phase: str, completed: int, total: int,
+    ) -> None:
+        """Persist optimizer and current stage progress for managed fits."""
+        if self.status_callback is None:
+            return
+        self.status_callback(
+            phase,
+            completed_steps=self.completed_steps,
+            total_steps=self.cfg.total_steps,
+            epoch=getattr(self, "epoch_index", 0),
+            total_epochs=self.cfg.get("epochs"),
+            completed_epochs=(
+                min(
+                    self.completed_steps // self.steps_per_epoch,
+                    self.cfg.epochs,
+                )
+                if self.cfg.get("epochs") is not None
+                and hasattr(self, "steps_per_epoch") else None
+            ),
+            completed=completed,
+            total=total,
+            unit="steps" if phase == "training" else "batches",
+        )
+
     def get_valid_outs(self):
         valid_loader = self.get_batch_iterator(
             self.task.valid_set,
@@ -188,10 +214,19 @@ class Runner:
             shuffle=False,
             num_workers=self.cfg.num_workers,
         )
+        progress = lambda done, total: self.report_progress(
+            "validation", done, total
+        )
         if self.monitor is not None:
             return self.task.get_valid_outs(
                 self.model, valid_loader, self.criterion, self.device,
                 rank_indices=self.rank_indices, collect_frequency=True,
+                progress_callback=progress,
+            )
+        if self.task.cfg.name == "spec_pretrain":
+            return self.task.get_valid_outs(
+                self.model, valid_loader, self.criterion, self.device,
+                progress_callback=progress,
             )
         valid_logging_outs = self.task.get_valid_outs(
             self.model, valid_loader, self.criterion, self.device
@@ -250,6 +285,15 @@ class Runner:
                 self.cfg.grad_clip,
             )
             self.completed_steps += 1
+            if (
+                self.completed_steps == 1
+                or self.completed_steps % STATUS_STEP_INTERVAL == 0
+                or self.completed_steps == self.cfg.total_steps
+            ):
+                self.report_progress(
+                    "training", self.completed_steps,
+                    self.cfg.total_steps,
+                )
             if self.monitor is not None:
                 self.monitor.train.add(logging_out, self.cfg.grad_clip)
                 self.monitor.epoch_train.add(
@@ -326,8 +370,18 @@ class Runner:
                         saved_best = True
                 if self.status_callback is not None:
                     self.status_callback(
-                        "running",
+                        "training",
                         completed_steps=self.completed_steps,
+                        total_steps=self.cfg.total_steps,
+                        epoch=self.epoch_index,
+                        total_epochs=self.cfg.get("epochs"),
+                        completed_epochs=min(
+                            self.completed_steps // self.steps_per_epoch,
+                            self.cfg.epochs,
+                        ) if self.cfg.get("epochs") is not None else None,
+                        completed=self.completed_steps,
+                        total=self.cfg.total_steps,
+                        unit="steps",
                         validation=valid_logging_outs,
                         best_validation=best_val,
                     )
@@ -384,6 +438,7 @@ class Runner:
             persistent_workers=self.cfg.num_workers > 0,
         )
 
+        self.steps_per_epoch = len(train_loader)
         if len(train_loader) == 0:
             raise ValueError(
                 "Training loader must contain at least one batch."
@@ -432,9 +487,18 @@ class Runner:
             persistent_workers=self.cfg.num_workers > 0,
         )
 
-        test_outs = self.task.get_valid_outs(
-            best_model, test_loader, self.criterion, self.device
-        )
+        if self.task.cfg.name == "spec_pretrain":
+            test_outs = self.task.get_valid_outs(
+                best_model, test_loader, self.criterion, self.device,
+                progress_callback=lambda done, total:
+                self.report_progress("test", done, total),
+            )
+        else:
+            self.report_progress("test", 0, len(test_loader))
+            test_outs = self.task.get_valid_outs(
+                best_model, test_loader, self.criterion, self.device
+            )
+            self.report_progress("test", len(test_loader), len(test_loader))
         if self.monitor is not None:
             self.monitor.record(
                 "test",

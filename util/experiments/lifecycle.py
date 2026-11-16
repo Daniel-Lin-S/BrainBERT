@@ -190,15 +190,15 @@ class FitRun:
 
     def status(self, phase: str, **details: object) -> None:
         """Replace the compact status document for this invocation."""
-        write_json(
-            self.logs / "status" / "status.json",
-            {
-                "fit_id": self.fit_id,
-                "phase": phase,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                **details,
-            },
-        )
+        path = self.logs / "status" / "status.json"
+        previous = json.loads(path.read_text()) if path.exists() else {}
+        previous.update(details)
+        previous.update({
+            "fit_id": self.fit_id,
+            "phase": phase,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        write_json(path, previous)
 
     def complete(self, metrics: dict) -> None:
         """Commit metrics and checkpoint checksums before completion."""

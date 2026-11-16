@@ -30,6 +30,7 @@ class SpecPretrain(BaseTask):
     def get_valid_outs(
         self, model, valid_loader, criterion, device,
         rank_indices=None, collect_frequency=False,
+        progress_callback=None,
     ):
         """Evaluate one pass and optionally collect bounded embeddings.
 
@@ -47,6 +48,8 @@ class SpecPretrain(BaseTask):
             Loader positions to pool into (N, D) embeddings, default None.
         collect_frequency : bool, optional
             Collect frequency sufficient statistics, default False.
+        progress_callback : callable, optional
+            Receives completed and total batch counts, default None.
 
         Returns
         -------
@@ -69,8 +72,10 @@ class SpecPretrain(BaseTask):
         monitor = Accumulator()
         embeddings = []
         offset = 0
+        if progress_callback is not None:
+            progress_callback(0, len(valid_loader))
         with torch.no_grad():
-            for batch in valid_loader:
+            for batch_number, batch in enumerate(valid_loader, start=1):
                 size = batch["target"].shape[0]
                 selected = [] if rank_indices is None else [
                     index - offset for index in rank_indices
@@ -99,6 +104,8 @@ class SpecPretrain(BaseTask):
                 all_outs["content_zero_baseline_l1"] += valid_outs[
                     "content_zero_baseline_l1"
                 ]
+                if progress_callback is not None:
+                    progress_callback(batch_number, len(valid_loader))
         for key in all_outs:
             all_outs[key] /= len(valid_loader)
         if rank_indices is not None:

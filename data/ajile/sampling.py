@@ -182,7 +182,8 @@ def _prepare_session(
 
 
 def prepare_selected(
-    dataset: object, selection: dict, workers: int = 1
+    dataset: object, selection: dict, workers: int = 1,
+    progress_callback=None,
 ) -> dict:
     """Cache selected raw STFTs and fit per-session frequency moments.
 
@@ -194,6 +195,8 @@ def prepare_selected(
         Frozen manifest of global indices by phase.
     workers : int, optional
         Independent session workers, default 1.
+    progress_callback : callable, optional
+        Receives completed and total session counts, default None.
 
     Returns
     -------
@@ -213,10 +216,14 @@ def prepare_selected(
         raise ValueError("workers must be positive.")
     tasks = [(dataset, session, sorted(indices))
              for session, indices in sorted(by_session.items())]
+    if progress_callback is not None:
+        progress_callback(0, len(tasks))
     if workers == 1:
         results = (_prepare_session(*task) for task in tasks)
         for name, values in results:
             moments[name] = values
+            if progress_callback is not None:
+                progress_callback(len(moments), len(tasks))
             print(f"Prepared AJILE session {name}.", flush=True)
     else:
         from concurrent.futures import (
@@ -230,6 +237,8 @@ def prepare_selected(
             for future in as_completed(futures):
                 name, values = future.result()
                 moments[name] = values
+                if progress_callback is not None:
+                    progress_callback(len(moments), len(tasks))
                 print(
                     f"Prepared AJILE session {name}: "
                     f"{len(moments)}/{len(tasks)} sessions.",
