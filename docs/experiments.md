@@ -10,6 +10,26 @@ separate experiment inputs. Supply them explicitly with `+campaign=NAME`,
 Set the CPU thread limit and GPU allocator limit after profiling the intended
 model and batch. No optimizer or batching settings live in machine config.
 
+## Multiple GPUs
+
+Set `CUDA_VISIBLE_DEVICES` to the permitted devices and
+`exp.runner.multi_gpu=true` to use the existing `DataParallel` runner.
+Training and validation batch sizes are global: each batch is divided among
+the visible GPUs, and the objective is evaluated on the gathered outputs.
+Keep these batch sizes unchanged when resuming on a different device count.
+Changing devices preserves fit identity and restores the saved optimizer
+step, but does not promise identical dropout or worker random streams.
+
+For hosts where NCCL device or shared-memory transport fails, set
+`NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, `NCCL_CUMEM_ENABLE=0`, and
+`NCCL_CUMEM_HOST_ENABLE=0` in the launch environment. This selects the socket
+fallback and must be configured before CUDA initialization. Machine-local
+Hydra overlays can supply these variables through `hydra.job.env_set`.
+Profile this fallback on the intended host; additional GPUs only accelerate
+the model work, so data loading can still limit total training throughput.
+
+## Shared artifacts
+
 The shared storage and runner modules are task-independent. Managed fit reuse
 currently validates file-manifest datasets; other datasets need a sample
 identity adapter as part of the separately planned data-loading work.
