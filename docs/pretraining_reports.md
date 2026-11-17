@@ -81,8 +81,21 @@ Total loss is normalized by the constant predictor's combined objective.
 Frequency figures normalize errors by a frozen training-target mean for each
 frequency; joint curves score the time–frequency intersection. Small condition
 summaries and the training mean are cached under campaign diagnostics for
-resumption. Figures share `reports/figures/test/fixed_masks/frequency`;
-source tables reside under `reports/tables/test/fixed_masks`.
+resumption. Figures under `reports/figures/test/fixed_masks` are grouped as:
+
+- `frequency/{l1,content_l1,total_loss}`: raw and constant-normalised curves for each duration.
+- `duration`: raw and constant-normalised batch-averaged objective comparisons.
+- `interpolation/{l1,content_l1,total_loss}`: model/interpolation ratios and standalone interpolation/constant baseline losses.
+- `interpolation/duration`: raw and interpolation-normalised batch-averaged temporal objectives.
+
+Source tables reside under `reports/tables/test/fixed_masks`. Frequency content
+L1 uses only cells with `abs(target) > 1`. Per-frequency total_loss is
+`L1(f) + alpha * content_L1(f)`, with the coefficient read from the fitted
+criterion. Its normalisation divides by the constant predictor's **combined**
+objective at that frequency. These frequency-local objectives are not additive
+contributions to the overall objective, which retains its original batch
+reduction. Joint duration objectives score the union; joint frequency curves
+score the intersection.
 
 
 For independent condition inference, pass explicit CUDA IDs with `--devices`.
@@ -98,4 +111,20 @@ profile with `--interpolation`. The baseline linearly interpolates between the
 nearest visible frames in each frequency bin. If a mask touches a window edge,
 it holds the one available endpoint; the diagnostic JSON records these cases.
 The comparison reuses saved model errors, uses exactly the original test masks,
-and saves relative L1 figures and source tables under `fixed_masks/interpolation`.
+and saves all three loss comparisons under `fixed_masks/interpolation`.
+The CPU-only replay records content-error sums and batch objectives in
+`interpolation_metrics.json`; earlier completed L1 summaries remain intact.
+It verifies that the replay reproduces their L1 sums. No model inference is
+needed for this replay.
+
+To estimate training content counts, additionally pass
+`--training-content-config conf/diagnostics/training_content.yaml`. This
+explicit profile samples 4,096 windows without replacement from the saved
+training selection and replays the original training mask recipe with stable
+per-window seeds. The histogram reports selected content cells by frequency
+and their fraction among selected cells. It is a subset estimate, not a replay
+of historical masks and not a measurement of reconstruction-error contribution.
+Its JSON lives under campaign diagnostics; the figure and CSV live under the
+training reports. Historical training monitor counts describe accumulated
+selected cell exposures across optimiser steps, including repeated epochs;
+they do not retain training content counts stratified by frequency.

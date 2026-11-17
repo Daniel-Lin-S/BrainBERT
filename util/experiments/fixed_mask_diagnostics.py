@@ -591,177 +591,210 @@ def plot_fixed(
     outputs: dict, frequency_axis: Sequence[float], frame_hop_ms: float,
     reports: Path, fit: Path, step: int, settings: Mapping,
 ) -> None:
-    """Publish four fixed-mask figures and their numerical source tables.
+    """Publish raw and constant-normalised test losses from saved summaries.
 
-    Parameters
-    ----------
-    outputs : dict
-        Condition summaries returned by evaluate_fixed.
-    frequency_axis : sequence of float
-        Physical STFT centres in Hz, shape (F,).
-    frame_hop_ms : float
-        Frame spacing in milliseconds.
-    reports, fit : pathlib.Path
-        Campaign report directory and immutable shared fit directory.
-    step : int
-        Validation-selected checkpoint update.
-    settings : mapping
-        Explicit report formats, splits and families.
+    Frequency figures are grouped by metric, with raw/normalised pairs for
+    each duration. Duration figures retain saved batch objective means.
+    Tables contain all three losses, counts, and matched baselines. No model
+    evaluation or change to completed diagnostic results occurs here.
     """
-    import matplotlib.pyplot as plt
+    import json
     import pandas as pd
     from .reporting import Report
 
-    report = Report(reports, fit, step, [], settings)
-    index_path = reports / "output_index.csv"
-    if index_path.exists():
-        report.entries = pd.read_csv(index_path).to_dict("records")
-    metrics = ("l1", "content_l1", "total_loss")
-    rows, frequency_rows = [], []
-    for name, result in outputs.items():
-        values = result["objective_means"]
-        row = {
-            "condition": name, "mask": result["mask"],
-            "duration_frames": result["duration_frames"],
-            "duration_ms": result["duration_frames"] * frame_hop_ms,
-        }
-        for index, metric in enumerate(metrics):
-            row[metric] = values[index]
-            row[f"constant_prediction_{metric}"] = values[index + 3]
-            row[f"relative_{metric}"] = checked_ratio(
-                values[index], values[index + 3]
-            )
-        rows.append(row)
-        for hz, sums in zip(frequency_axis, result["frequency_sums"]):
-            frequency_rows.append({
-                "condition": name, "frequency_hz": hz,
-                **dict(zip(SUM_COLUMNS, sums)),
-                "relative_l1": checked_ratio(sums[1], sums[2]),
-                "relative_content_l1": checked_ratio(sums[4], sums[5]),
-            })
-    overall = pd.DataFrame(rows)
-    frequencies = pd.DataFrame(frequency_rows)
-    prefix = "test/fixed_masks"
-    report.table(
-        f"{prefix}/duration/objective", overall,
-        "Test fixed-mask objectives and previous zero-predictor baselines",
-    )
-    report.table(
-        f"{prefix}/frequency/reconstruction", frequencies,
-        "Test frequency errors relative to frozen training means",
-    )
-    styles = {
-        "temporal": ("#0072B2", "-", "o"),
-        "spectral": ("#009E73", "--", "s"),
-        "joint": ("#D55E00", "-.", "^"),
-    }
-    titles = ("L1", "Content L1", "Total loss")
-    complete_durations = [
-        d for d in sorted(overall.duration_frames.unique()) if d
-        and f"temporal_{d}" in outputs and f"joint_{d}" in outputs
+    alpha = json.loads((fit / "scientific.json").read_text())["criterion"][
+        "alpha"
     ]
+    overall, frequencies = fixed_loss_tables(
+        outputs, frequency_axis, frame_hop_ms, alpha,
+    )
+    report = Report(reports, fit, step, [], settings)
+    index = reports / "output_index.csv"
+    if index.exists():
+        report.entries = pd.read_csv(index).to_dict("records")
+    report.table(
+        "test/fixed_masks/duration/objective", overall,
+        "Batch-averaged test objectives; joint masks score their union",
+    )
+    report.table(
+        "test/fixed_masks/frequency/reconstruction", frequencies,
+        "Cell-pooled frequency losses; joint masks score their intersection; "
+        "total_loss = L1 + alpha * content_L1 within each frequency",
+    )
     expected = next(iter(outputs.values()))["identity"][
         "configuration"
     ]["durations_frames"]
-    if set(complete_durations) == set(expected):
-        fig, axes = plt.subplots(1, 3, figsize=(23, 7))
-        for ax, metric, title in zip(axes, metrics, titles):
-            for kind in ("temporal", "joint"):
-                subset = overall[overall["mask"] == kind].sort_values(
-                    "duration_ms"
-                )
-                color, style, marker = styles[kind]
-                ax.plot(
-                    subset.duration_ms, subset[f"relative_{metric}"],
-                    color=color, ls=style, marker=marker, lw=2.5,
-                    label=kind.capitalize(),
-                )
-            spectral = overall[overall["mask"] == "spectral"].iloc[0]
-            ax.axhline(
-                spectral[f"relative_{metric}"], color=styles["spectral"][0],
-                ls="--", lw=2.5, label="Spectral",
+    durations = [d for d in expected if all(
+        name in outputs for name in ("spectral", f"temporal_{d}", f"joint_{d}")
+    )]
+    root = reports.parent / "diagnostics/fixed_masks"
+    interpolation_path = root / "interpolation_metrics.json"
+    if not interpolation_path.exists():
+        interpolation_path = root / "interpolation.json"
+    interpolation = (
+        json.loads(interpolation_path.read_text())
+        if interpolation_path.exists() else None
+    )
+    if interpolation is not None and interpolation["identity"] != next(
+        iter(outputs.values())
+    )["identity"]:
+        raise ValueError("Interpolation and model provenance differ.")
+    if (interpolation is not None and "criterion_alpha" in interpolation
+            and interpolation["criterion_alpha"] != alpha):
+        raise ValueError("Interpolation criterion coefficient differs.")
+    for normalised in (False, True):
+        for duration in durations:
+            plot_frequency_losses(
+                report, frequencies, duration, frame_hop_ms, normalised,
+                interpolation, alpha,
             )
-            ax.axhline(1, color="0.5", ls=":", label="Constant prediction")
-            ticks = overall[overall["mask"] == "temporal"]
-            ax.set_xticks(ticks.duration_ms, [
-                f"{row.duration_ms:.0f} ms\n({row.duration_frames} frames)"
-                for row in ticks.itertuples()
-            ])
-            ax.set_xlabel("Temporal mask duration")
-            ax.set_ylabel("Loss / constant prediction loss")
-            ax.set_title(title)
-        report.figure(
-            f"{prefix}/frequency/duration_comparison", fig,
-            "Mask duration and relative reconstruction loss; "
-            f"validation-selected checkpoint {step}",
-        )
-    for duration in complete_durations:
-        if not duration:
-            continue
-        fig, ax = plt.subplots(figsize=(13, 8))
-        for kind in MASK_TYPES:
-            name = "spectral" if kind == "spectral" else f"{kind}_{duration}"
-            subset = frequencies[frequencies.condition == name]
-            color, style, marker = styles[kind]
-            label = "Joint intersection" if kind == "joint" else kind.title()
-            ax.plot(
-                subset.frequency_hz, subset.relative_l1,
-                color=color, ls=style, lw=2.5, label=label,
-            )
-        ax.axhline(1, color="0.5", ls=":", label="Constant prediction L1")
-        ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("L1 / constant prediction L1")
-        report.figure(
-            f"{prefix}/frequency/duration_{duration}", fig,
-            f"Reconstruction: {duration} frames "
-            f"({duration * frame_hop_ms:.0f} ms); "
-            f"validation-selected checkpoint {step}",
-        )
-    if set(complete_durations) == set(expected):
-        from .storage import atomic_write, file_digest
-
-        ready = reports / "figures/test/fixed_masks/frequency"
-        required = [ready / "duration_comparison.png"] + [
-            ready / f"duration_{duration}.png" for duration in expected
-        ]
-        if all(path.exists() for path in required):
-            archive = reports.parent / (
-                "diagnostics/fixed_masks/previous_reports"
-            )
-            removed = set()
-            for pattern in (
-                "frequency_reconstruction*.png", "frequency_coverage*.png",
-            ):
-                for old in (reports / "figures/test").glob(pattern):
-                    archive.mkdir(parents=True, exist_ok=True)
-                    destination = archive / old.name
-                    if destination.exists():
-                        if file_digest(old) != file_digest(destination):
-                            raise ValueError(
-                                "Archived frequency figure differs."
-                            )
-                        old.unlink()
-                    else:
-                        old.rename(destination)
-                    removed.add(str(old.relative_to(reports)))
-            index = pd.read_csv(index_path)
-            index = index[~index.output.isin(removed)]
-            atomic_write(
-                index_path, lambda p: index.to_csv(p, index=False),
-                lambda p: pd.read_csv(p),
-            )
-    if set(complete_durations) == set(expected):
-        import json
-
-        root = reports.parent / "diagnostics/fixed_masks"
-        path = root / "interpolation.json"
-        interpolation = json.loads(path.read_text()) if path.exists() else None
-        plot_absolute_fixed(
-            outputs, frequency_axis, frame_hop_ms, reports, fit, step,
-            settings, interpolation,
-        )
+        if set(durations) == set(expected):
+            plot_duration_losses(report, overall, durations, normalised)
+    if set(durations) == set(expected):
+        retire_fixed_figures(report, durations)
     print(f"Fixed-mask reports saved: {reports.resolve()}", flush=True)
 
+
+def plot_frequency_losses(
+    report: Any, frame: Any, duration: int, hop_ms: float,
+    normalised: bool, interpolation: dict | None, alpha: float,
+) -> None:
+    """Draw three losses across frequency for one paired mask duration."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    temporal = frame[frame.condition == f"temporal_{duration}"]
+    for metric, title in zip(LOSS_METRICS, LOSS_LABELS):
+        fig, ax = plt.subplots(figsize=(13, 8))
+        for kind, (color, style) in MASK_STYLES.items():
+            name = "spectral" if kind == "spectral" else f"{kind}_{duration}"
+            subset = frame[frame.condition == name]
+            label = "Joint intersection" if kind == "joint" else kind.title()
+            column = f"relative_{metric}" if normalised else metric
+            ax.plot(subset.frequency_hz, subset[column], color=color,
+                    ls=style, lw=2.5, label=label)
+        baseline_label = BASELINE_LABELS[LOSS_METRICS.index(metric)]
+        if normalised:
+            ax.axhline(1, color="0.55", ls=":", label=baseline_label)
+        else:
+            ax.plot(
+                temporal.frequency_hz,
+                temporal[f"constant_prediction_{metric}"],
+                color="0.55", ls=":", lw=2.5,
+                label=f"{baseline_label}\n(temporal)",
+            )
+            if interpolation is not None and (
+                metric == "l1" or "content_error_sums" in interpolation
+            ):
+                l1 = np.asarray(interpolation["error_sums"][str(duration)])
+                l1 = l1 / temporal["count"].to_numpy()
+                value = l1
+                if metric != "l1":
+                    content = np.asarray(
+                        interpolation["content_error_sums"][str(duration)]
+                    ) / temporal.content_count.to_numpy()
+                    value = content if metric == "content_l1" else (
+                        l1 + alpha * content
+                    )
+                ax.plot(temporal.frequency_hz, value, color="0.25",
+                        ls="--", lw=2.5, label="Temporal interpolation")
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel(
+            f"{title} / constant prediction loss" if normalised
+            else f"{title} (normalised targets)"
+        )
+        suffix = "_normalised" if normalised else ""
+        report.figure(
+            f"test/fixed_masks/frequency/{metric}/duration_{duration}{suffix}",
+            fig, f"{title}: {duration} frames ({duration * hop_ms:.0f} ms); "
+            f"validation-selected checkpoint {report.best}",
+        )
+
+
+def plot_duration_losses(
+    report: Any, frame: Any, durations: Sequence[int], normalised: bool,
+) -> None:
+    """Plot the recorded batch-mean objectives, with joint union scoring."""
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3, figsize=(23, 7))
+    for ax, metric, title in zip(axes, LOSS_METRICS, LOSS_LABELS):
+        column = f"relative_{metric}" if normalised else metric
+        for kind in ("temporal", "joint"):
+            subset = frame[frame["mask"] == kind].sort_values("duration_ms")
+            color, style = MASK_STYLES[kind]
+            ax.plot(subset.duration_ms, subset[column], color=color,
+                    ls=style, marker="o", lw=2.5, label=kind.title())
+        ax.axhline(frame[frame["mask"] == "spectral"].iloc[0][column],
+                   color=MASK_STYLES["spectral"][0], ls="--", lw=2.5,
+                   label="Spectral")
+        if normalised:
+            ax.axhline(1, color="0.55", ls=":", label="Constant prediction")
+        ticks = frame[frame["mask"] == "temporal"].sort_values("duration_ms")
+        ax.set_xticks(ticks.duration_ms, [
+            f"{row.duration_ms:.0f} ms\n({row.duration_frames} frames)"
+            for row in ticks.itertuples()
+        ])
+        ax.set_xlabel("Temporal mask duration")
+        ax.set_ylabel("Loss / constant prediction loss" if normalised
+                      else "Loss (normalised targets)")
+        ax.set_title(title)
+    name = "constant_normalised" if normalised else "raw"
+    report.figure(
+        f"test/fixed_masks/duration/{name}", fig,
+        "Mask duration and reconstruction loss; "
+        f"validation-selected checkpoint {report.best}",
+    )
+
+
+def retire_fixed_figures(report: Any, durations: Sequence[int]) -> None:
+    """Remove superseded derived figures only after replacements are audited.
+
+    Completed diagnostic JSONs are never modified. Legacy adaptive figures
+    remain archived separately from the active fixed-mask report tree.
+    """
+    import pandas as pd
+    from .storage import atomic_write, file_digest
+
+    prefix = "figures/test/fixed_masks"
+    replacements = [f"{prefix}/duration/{name}.png"
+                    for name in ("raw", "constant_normalised")]
+    replacements.extend(
+        f"{prefix}/frequency/{metric}/duration_{d}{suffix}.png"
+        for metric in LOSS_METRICS for d in durations
+        for suffix in ("", "_normalised")
+    )
+    if not all((report.root / name).exists() for name in replacements):
+        return
+    removed = set()
+    folders = ("frequency", "l1_by_frequency", "normalised_l1_by_frequency")
+    names = ["duration_comparison", *[f"duration_{d}" for d in durations]]
+    for folder in folders:
+        for name in names:
+            relative = f"{prefix}/{folder}/{name}.png"
+            (report.root / relative).unlink(missing_ok=True)
+            removed.add(relative)
+        directory = report.root / prefix / folder
+        if directory.exists() and not any(directory.iterdir()):
+            directory.rmdir()
+    archive = report.root.parent / "diagnostics/fixed_masks/previous_reports"
+    for pattern in ("frequency_reconstruction*.png", "frequency_coverage*.png"):
+        for old in (report.root / "figures/test").glob(pattern):
+            archive.mkdir(parents=True, exist_ok=True)
+            destination = archive / old.name
+            if destination.exists():
+                if file_digest(old) != file_digest(destination):
+                    raise ValueError("Archived frequency figure differs.")
+                old.unlink()
+            else:
+                old.rename(destination)
+            removed.add(str(old.relative_to(report.root)))
+    report.entries = [e for e in report.entries if e["output"] not in removed]
+    frame = pd.DataFrame(report.entries)
+    atomic_write(
+        report.root / "output_index.csv",
+        lambda p: frame.to_csv(p, index=False), lambda p: pd.read_csv(p),
+    )
 
 
 def linear_temporal_errors(
@@ -996,111 +1029,13 @@ def plot_interpolation(
     result: dict, root: Path, axis: Sequence[float], reports: Path,
     fit: Path, step: int, settings: Mapping,
 ) -> None:
-    """Publish paired relative L1 curves and frequency-level source table."""
-    import json
-    import matplotlib.pyplot as plt
-    import pandas as pd
-    from .reporting import Report
+    """Publish paired model/interpolation losses and standalone baselines.
 
-    report = Report(reports, fit, step, [], settings)
-    index = reports / "output_index.csv"
-    if index.exists():
-        report.entries = pd.read_csv(index).to_dict("records")
-    rows = []
-    for duration in result["identity"]["configuration"]["durations_frames"]:
-        saved = json.loads(
-            (root / "conditions" / f"temporal_{duration}.json").read_text()
-        )
-        frame_rows = []
-        for hz, model, baseline in zip(
-            axis, saved["frequency_sums"], result["error_sums"][str(duration)]
-        ):
-            ratio = model[1] / baseline if baseline > 0 else None
-            if ratio is None:
-                warnings.warn("Interpolation L1 is zero; ratio is undefined.")
-            frame_rows.append({
-                "duration_frames": duration, "frequency_hz": hz,
-                "count": model[0], "model_error_sum": model[1],
-                "interpolation_error_sum": baseline,
-                "interpolation_l1": baseline / model[0],
-                "model_l1": model[1] / model[0],
-                "constant_prediction_l1": model[2] / model[0],
-                "relative_l1": ratio,
-            })
-        frame = pd.DataFrame(frame_rows)
-        rows.extend(frame_rows)
-        fig, ax = plt.subplots(figsize=(13, 8))
-        ax.plot(
-            frame.frequency_hz, frame.relative_l1,
-            color="#0072B2", lw=2.5, label="BrainBERT",
-        )
-        ax.axhline(1, color="0.5", ls="--", lw=2.5,
-                   label="Temporal interpolation")
-        ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("L1 / interpolation L1")
-        ms = duration * result["identity"]["configuration"]["frame_hop_ms"]
-        report.figure(
-            f"test/fixed_masks/interpolation/frequency/duration_{duration}",
-            fig, f"Temporal reconstruction: {duration} frames ({ms:.0f} ms); "
-            f"validation-selected checkpoint {step}",
-        )
-        fig, ax = plt.subplots(figsize=(13, 8))
-        ax.plot(
-            frame.frequency_hz, frame.interpolation_l1,
-            color="0.25", lw=2.5, label="Temporal interpolation",
-        )
-        ax.plot(
-            frame.frequency_hz, frame.constant_prediction_l1,
-            color="0.55", ls="--", lw=2.5, label="Constant prediction L1",
-        )
-        ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("L1 (normalized targets)")
-        report.figure(
-            f"test/fixed_masks/interpolation/frequency/baseline_{duration}",
-            fig, f"Temporal baselines: {duration} frames ({ms:.0f} ms)",
-        )
-    report.table(
-        "test/fixed_masks/interpolation/frequency/reconstruction",
-        pd.DataFrame(rows),
-        "Temporal reconstruction relative to local interpolation",
-    )
-    outputs = {}
-    for path in sorted((root / "conditions").glob("*.json")):
-        saved = json.loads(path.read_text())
-        if saved["identity"] == result["identity"]:
-            outputs[path.stem] = saved
-    plot_absolute_fixed(
-        outputs, axis, result["identity"]["configuration"]["frame_hop_ms"],
-        reports, fit, step, settings, interpolation=result,
-    )
-    print(f"Interpolation reports saved: {reports.resolve()}", flush=True)
-
-
-
-def plot_absolute_fixed(
-    outputs: dict, frequency_axis: Sequence[float], frame_hop_ms: float,
-    reports: Path, fit: Path, step: int, settings: Mapping,
-    interpolation: dict | None = None,
-) -> None:
-    """Plot unscaled fixed-mask losses using completed sufficient statistics.
-
-    Parameters
-    ----------
-    outputs : dict
-        Saved per-condition objective means and frequency error sums.
-    frequency_axis : sequence of float
-        Physical frequency-bin centres in Hz, shape (F,).
-    frame_hop_ms : float
-        Spacing of STFT frames in milliseconds.
-    reports, fit : pathlib.Path
-        Report root and immutable fit directory.
-    step : int
-        Validation-selected checkpoint step.
-    settings : mapping
-        Explicit report formats, splits and families.
-    interpolation : dict or None, optional
-        Matched temporal interpolation sums, default None.
+    Each metric has duration-specific frequency figures for relative model
+    loss and absolute baseline loss. Overall comparisons use the exact saved
+    batch means; frequency comparisons pool cells within each bin.
     """
+    import json
     import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
@@ -1110,89 +1045,153 @@ def plot_absolute_fixed(
     index = reports / "output_index.csv"
     if index.exists():
         report.entries = pd.read_csv(index).to_dict("records")
-    configuration = next(iter(outputs.values()))["identity"]["configuration"]
-    durations = configuration["durations_frames"]
-    if any(f"{kind}_{d}" not in outputs for d in durations
-           for kind in ("temporal", "joint")) or "spectral" not in outputs:
-        raise ValueError("All fixed-mask conditions must be complete.")
-    styles = {
-        "temporal": ("#0072B2", "-", "Temporal"),
-        "spectral": ("#009E73", "--", "Spectral"),
-        "joint": ("#D55E00", "-.", "Joint intersection"),
-    }
-    prefix = "test/fixed_masks/l1_by_frequency"
-    for duration in durations:
-        fig, ax = plt.subplots(figsize=(13, 8))
-        for kind in MASK_TYPES:
-            name = "spectral" if kind == "spectral" else f"{kind}_{duration}"
-            sums = np.asarray(outputs[name]["frequency_sums"], dtype=float)
-            if sums.shape != (len(frequency_axis), len(SUM_COLUMNS)):
-                raise ValueError(
-                    "Fixed-mask frequency statistics shape differs."
-                )
-            if (sums[:, 0] <= 0).any():
-                raise ValueError("Every frequency needs masked target cells.")
-            color, style, label = styles[kind]
-            ax.plot(
-                frequency_axis, sums[:, 1] / sums[:, 0], color=color,
-                ls=style, lw=2.5, label=label,
+    options = result["identity"]["configuration"]
+    alpha = result["criterion_alpha"]
+    rows, overall_rows, outputs = [], [], {}
+    for path in sorted((root / "conditions").glob("*.json")):
+        saved = json.loads(path.read_text())
+        if saved["identity"] != result["identity"]:
+            raise ValueError("Interpolation and model provenance differ.")
+        outputs[path.stem] = saved
+    for duration in options["durations_frames"]:
+        saved = outputs[f"temporal_{duration}"]
+        model = frequency_losses(saved["frequency_sums"], alpha)
+        baseline_sums = np.asarray(saved["frequency_sums"], dtype=float)
+        baseline_sums[:, 1] = result["error_sums"][str(duration)]
+        baseline_sums[:, 4] = result["content_error_sums"][str(duration)]
+        interpolation = frequency_losses(baseline_sums, alpha)["model"]
+        ms = duration * options["frame_hop_ms"]
+        for metric_index, (metric, title) in enumerate(zip(
+            LOSS_METRICS, LOSS_LABELS,
+        )):
+            numerator = model["model"][:, metric_index]
+            denominator = interpolation[:, metric_index]
+            ratio = [checked_ratio(a, b)
+                     for a, b in zip(numerator, denominator)]
+            for i, hz in enumerate(axis):
+                rows.append({
+                    "duration_frames": duration, "frequency_hz": hz,
+                    "metric": metric, "model_loss": numerator[i],
+                    "interpolation_loss": denominator[i],
+                    "constant_prediction_loss": model["constant"][
+                        i, metric_index
+                    ],
+                    "model_over_interpolation": ratio[i],
+                    "count": baseline_sums[i, 0],
+                    "content_count": baseline_sums[i, 3],
+                })
+            fig, ax = plt.subplots(figsize=(13, 8))
+            ax.plot(axis, ratio, color="#0072B2", lw=2.5, label="Model")
+            ax.axhline(1, color="0.5", ls="--", lw=2.5,
+                       label="Temporal interpolation")
+            ax.set_xlabel("Frequency (Hz)")
+            ax.set_ylabel(f"{title} / interpolation loss")
+            prefix = f"test/fixed_masks/interpolation/{metric}"
+            report.figure(
+                f"{prefix}/duration_{duration}", fig,
+                f"Temporal {title}: {duration} frames ({ms:.0f} ms); "
+                f"validation-selected checkpoint {step}",
             )
-        temporal = np.asarray(outputs[f"temporal_{duration}"][
-            "frequency_sums"
-        ])
-        ax.plot(
-            frequency_axis, temporal[:, 2] / temporal[:, 0], color="0.55",
-            ls=":", lw=2.5, label="Constant prediction L1 (temporal)",
-        )
-        if interpolation is not None:
-            if interpolation["identity"] != outputs[
-                f"temporal_{duration}"
-            ]["identity"]:
-                raise ValueError("Interpolation provenance differs from fit.")
-            errors = np.asarray(interpolation["error_sums"][str(duration)])
-            if errors.shape != temporal[:, 0].shape:
-                raise ValueError("Interpolation frequency count differs.")
-            ax.plot(
-                frequency_axis, errors / temporal[:, 0], color="0.25",
-                ls="--", lw=2.5, label="Temporal interpolation",
+            fig, ax = plt.subplots(figsize=(13, 8))
+            ax.plot(axis, denominator, color="0.25", lw=2.5,
+                    label="Temporal interpolation")
+            ax.plot(axis, model["constant"][:, metric_index],
+                    color="0.55", ls="--", lw=2.5,
+                    label=BASELINE_LABELS[metric_index])
+            ax.set_xlabel("Frequency (Hz)")
+            ax.set_ylabel(f"{title} (normalised targets)")
+            report.figure(
+                f"{prefix}/baseline_{duration}", fig,
+                f"Temporal baseline {title}: {duration} frames ({ms:.0f} ms)",
             )
-        ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("L1 (normalized targets)")
-        report.figure(
-            f"{prefix}/duration_{duration}", fig,
-            f"Reconstruction: {duration} frames "
-            f"({duration * frame_hop_ms:.0f} ms); "
-            f"validation-selected checkpoint {step}",
-        )
-    fig, axes = plt.subplots(1, 3, figsize=(23, 7))
-    for metric, ax, title in zip(
-        range(3), axes, ("L1", "Content L1", "Total loss")
-    ):
-        for kind in ("temporal", "joint"):
-            color, style, label = styles[kind]
-            values = [outputs[f"{kind}_{d}"]["objective_means"][metric]
-                      for d in durations]
-            ax.plot(
-                [d * frame_hop_ms for d in durations], values,
-                color=color, ls=style, marker="o", lw=2.5, label=label,
-            )
-        ax.axhline(
-            outputs["spectral"]["objective_means"][metric],
-            color=styles["spectral"][0], ls="--", lw=2.5,
-            label="Spectral",
-        )
-        ax.set_xticks([d * frame_hop_ms for d in durations], [
-            f"{d * frame_hop_ms:.0f} ms\n({d} frames)" for d in durations
-        ])
-        ax.set_xlabel("Temporal mask duration")
-        ax.set_ylabel("Loss (normalized targets)")
-        ax.set_title(title)
-    report.figure(
-        f"{prefix}/duration_comparison", fig,
-        f"Mask duration and reconstruction loss; "
-        f"validation-selected checkpoint {step}",
+            overall_rows.append({
+                "duration_frames": duration, "duration_ms": ms,
+                "metric": metric,
+                "model_loss": saved["objective_means"][metric_index],
+                "interpolation_loss": result["objective_means"][
+                    str(duration)
+                ][metric_index],
+                "constant_prediction_loss": saved["objective_means"][
+                    metric_index + 3
+                ],
+            })
+    report.table(
+        "test/fixed_masks/interpolation/frequency/reconstruction",
+        pd.DataFrame(rows), "Cell-pooled losses on paired temporal masks",
     )
-    print(f"Fixed-mask L1 figures saved: {reports.resolve()}", flush=True)
+    overall = pd.DataFrame(overall_rows)
+    overall["model_over_interpolation"] = [
+        checked_ratio(a, b) for a, b in zip(
+            overall.model_loss, overall.interpolation_loss,
+        )
+    ]
+    report.table(
+        "test/fixed_masks/interpolation/duration/objective", overall,
+        "Paired temporal batch-averaged objectives",
+    )
+    plot_interpolation_duration(report, overall)
+    removed = set()
+    for duration in options["durations_frames"]:
+        for name in ("duration", "baseline"):
+            relative = (
+                "figures/test/fixed_masks/interpolation/frequency/"
+                f"{name}_{duration}.png"
+            )
+            replacement = reports / relative.replace("/frequency/", "/l1/")
+            if replacement.exists():
+                (reports / relative).unlink(missing_ok=True)
+                removed.add(relative)
+    from .storage import atomic_write
+
+    entries = pd.DataFrame([e for e in report.entries
+                            if e["output"] not in removed])
+    atomic_write(index, lambda p: entries.to_csv(p, index=False),
+                 lambda p: pd.read_csv(p))
+    previous = reports / "figures/test/fixed_masks/interpolation/frequency"
+    if previous.exists() and not any(previous.iterdir()):
+        previous.rmdir()
+    plot_fixed(outputs, axis, options["frame_hop_ms"], reports, fit, step,
+               settings)
+    print(f"Interpolation reports saved: {reports.resolve()}", flush=True)
+
+
+def plot_interpolation_duration(report: Any, frame: Any) -> None:
+    """Compare temporal batch objectives across durations for all metrics."""
+    import matplotlib.pyplot as plt
+
+    for normalised in (False, True):
+        fig, axes = plt.subplots(1, 3, figsize=(23, 7))
+        for ax, metric, title in zip(axes, LOSS_METRICS, LOSS_LABELS):
+            subset = frame[frame.metric == metric].sort_values("duration_ms")
+            if normalised:
+                ax.plot(subset.duration_ms, subset.model_over_interpolation,
+                        color="#0072B2", lw=2.5, marker="o", label="Model")
+                ax.axhline(1, color="0.25", ls="--",
+                           label="Temporal interpolation")
+            else:
+                for column, color, style, label in (
+                    ("model_loss", "#0072B2", "-", "Model"),
+                    ("interpolation_loss", "0.25", "--",
+                     "Temporal interpolation"),
+                    ("constant_prediction_loss", "0.55", ":",
+                     "Constant prediction"),
+                ):
+                    ax.plot(subset.duration_ms, subset[column], color=color,
+                            ls=style, marker="o", lw=2.5, label=label)
+            ax.set_title(title)
+            ax.set_xticks(subset.duration_ms, [
+                f"{row.duration_ms:.0f} ms\n({row.duration_frames} frames)"
+                for row in subset.itertuples()
+            ])
+            ax.set_xlabel("Temporal mask duration")
+            ax.set_ylabel("Loss / interpolation loss" if normalised
+                          else "Loss (normalised targets)")
+        name = "normalised" if normalised else "raw"
+        report.figure(
+            f"test/fixed_masks/interpolation/duration/{name}", fig,
+            "Temporal reconstruction and local interpolation; "
+            f"validation-selected checkpoint {report.best}",
+        )
 
 
 def training_content_counts(

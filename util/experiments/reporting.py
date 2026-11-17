@@ -273,9 +273,15 @@ class Report:
             family = "mask_margins"
         elif "/full_grid/" in name:
             family = "mask_full_grid"
-        elif "frequency_coverage/" in name:
+        elif "frequency_coverage/" in name or "/content_distribution/" in name:
             family = "frequency_coverage"
-        elif "/frequency/" in name or "/l1_by_frequency/" in name:
+        elif "/duration/" in name and "/fixed_masks/" in name:
+            family = ("frequency_errors" if kind == "figures"
+                      else "objective_components")
+        elif (
+            "/frequency/" in name or "/l1_by_frequency/" in name
+            or "/fixed_masks/interpolation/" in name
+        ):
             family = "frequency_errors"
         elif "/representation/" in name:
             family = "representation_rank"
@@ -703,7 +709,7 @@ def frequency_figures(
     """Plot actual-bin frequency errors and selection rates."""
     for phase in phases:
         replacement = report.root / (
-            "figures/test/fixed_masks/frequency/duration_comparison.png"
+            "figures/test/fixed_masks/duration/constant_normalised.png"
         )
         if phase == "test" and replacement.exists():
             continue

@@ -199,7 +199,7 @@ def test_interpolation_content_errors_exclude_noncontent_targets():
 
 
 def test_training_content_counts_only_selected_cells(tmp_path, monkeypatch):
-    """Subset estimates preserve RNG state and exclude unselected/padded cells."""
+    """Subset counts preserve RNG state and exclude unselected/padded cells."""
     import random
     from types import SimpleNamespace
     from util.experiments.fixed_mask_diagnostics import training_content_counts
