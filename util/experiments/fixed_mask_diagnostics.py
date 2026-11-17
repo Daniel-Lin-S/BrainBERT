@@ -625,3 +625,236 @@ def plot_fixed(
                 lambda p: pd.read_csv(p),
             )
     print(f"Fixed-mask reports saved: {reports.resolve()}", flush=True)
+
+
+
+def linear_temporal_errors(
+    target: torch.Tensor, padding: torch.Tensor, mask: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Sum linear interpolation errors over a single temporal gap.
+
+    Parameters
+    ----------
+    target : torch.Tensor
+        Normalized target magnitudes, shape (B, T, F).
+    padding : torch.Tensor
+        Padded-frame indicators, shape (B, T).
+    mask : torch.Tensor
+        Contiguous temporal gap shared across frequencies, shape (B, T, F).
+
+    Returns
+    -------
+    tuple
+        Absolute-error sums of shape (F,), and edge-gap window count. Where
+        a gap touches a window edge, use the single available endpoint.
+    """
+    if target.ndim != 3 or mask.shape != target.shape:
+        raise ValueError("Expected target and mask with shape (B, T, F).")
+    if padding.shape != target.shape[:2]:
+        raise ValueError("Padding must match target batch and time dimensions.")
+    if not torch.isfinite(target).all():
+        raise ValueError("Interpolation targets must be finite.")
+    temporal = mask[:, :, 0].bool()
+    if not torch.equal(mask.bool(), temporal[:, :, None].expand_as(mask)):
+        raise ValueError("Temporal masks must match across all frequencies.")
+    lengths = (~padding.bool()).sum(dim=1)
+    counts = temporal.sum(dim=1)
+    if (counts == 0).any():
+        raise ValueError("Interpolation requires one nonempty mask per window.")
+    starts = temporal.int().argmax(dim=1)
+    ends = starts + counts
+    frames = torch.arange(target.shape[1], device=target.device)
+    expected = (frames[None, :] >= starts[:, None]) & (
+        frames[None, :] < ends[:, None]
+    )
+    if not torch.equal(temporal, expected) or (ends > lengths).any():
+        raise ValueError("Expected one contiguous mask within valid frames.")
+    has_left, has_right = starts > 0, ends < lengths
+    if not (has_left | has_right).all():
+        raise ValueError("Interpolation needs at least one unmasked endpoint.")
+    rows = torch.arange(target.shape[0], device=target.device)
+    left_idx = torch.where(has_left, starts - 1, ends)
+    right_idx = torch.where(has_right, ends, starts - 1)
+    left = target[rows, left_idx]
+    right = target[rows, right_idx]
+    fraction = (frames[None, :] - starts[:, None] + 1).to(target.dtype)
+    fraction = fraction / (counts[:, None] + 1)
+    estimate = left[:, None, :] + fraction[:, :, None] * (
+        right - left
+    )[:, None, :]
+    error = ((estimate - target).abs().double() * mask).sum((0, 1))
+    if not torch.isfinite(error).all():
+        raise ValueError("Interpolation errors must be finite.")
+    return error, int((~(has_left & has_right)).sum())
+
+
+@torch.inference_mode()
+def evaluate_interpolation(
+    task: Any, options: Mapping, root: Path, identity: dict,
+    workers: int, progress: Callable, batch_size: int,
+    smoke_batches: int | None = None,
+) -> dict:
+    """Evaluate interpolation on the original paired temporal masks.
+
+    The existing condition JSON supplies exact BrainBERT error and counts;
+    a single pass computes interpolation error sums for all durations.
+    The resulting JSON records sums, edge counts and provenance without
+    persisting targets. Partial aggregate sums allow interrupted replay.
+    """
+    import json
+    import math
+    from .storage import write_json
+    from util.mask_utils import test_masked_dataset
+
+    identity = {**identity, "configuration": dict(options)}
+    durations = list(options["durations_frames"])
+    conditions = {}
+    for duration in durations:
+        path = root / "conditions" / f"temporal_{duration}.json"
+        saved = json.loads(path.read_text())
+        if saved["identity"] != identity:
+            raise ValueError("Saved temporal condition provenance differs.")
+        conditions[str(duration)] = saved
+    dataset = test_masked_dataset(task.test_set, targets_only=True)
+    total = math.ceil(len(dataset) / batch_size)
+    if total != options["batches"]:
+        raise ValueError("Test batch count differs from saved diagnostic.")
+    frequency_count = len(conditions[str(durations[0])]["frequency_sums"])
+    bins = balanced_bins(len(dataset), frequency_count, options["seed"])
+    result_path = root / "interpolation.json"
+    partial_path = root / "interpolation_partial.json"
+    if result_path.exists() and smoke_batches is None:
+        result = json.loads(result_path.read_text())
+        if result["identity"] != identity:
+            raise ValueError("Saved interpolation provenance differs.")
+        return result
+    sums = {str(d): torch.zeros(frequency_count, dtype=torch.float64)
+            for d in durations}
+    edges = {str(d): 0 for d in durations}
+    offset, completed = 0, 0
+    if partial_path.exists() and smoke_batches is None:
+        state = json.loads(partial_path.read_text())
+        if state["identity"] != identity:
+            raise ValueError("Partial interpolation provenance differs.")
+        offset, completed = state["windows"], state["batches"]
+        sums = {k: torch.tensor(v, dtype=torch.float64)
+                for k, v in state["error_sums"].items()}
+        edges = state["edge_windows"]
+    subset = torch.utils.data.Subset(dataset, range(offset, len(dataset)))
+    loader = task.get_batch_iterator(
+        subset, batch_size, shuffle=False, num_workers=workers,
+    )
+    for batch in loader:
+        target, padding = batch["target"], batch["attn_mask"].bool()
+        indices = torch.arange(offset, offset + len(target))
+        for duration in durations:
+            mask, _ = fixed_masks(
+                padding, frequency_count, indices, duration, max(durations),
+                bins, options["seed"],
+            )
+            error, edge_count = linear_temporal_errors(target, padding, mask)
+            sums[str(duration)] += error
+            edges[str(duration)] += edge_count
+        offset += len(target)
+        completed += 1
+        progress(completed, total, "temporal_interpolation")
+        if smoke_batches is None and completed % PARTIAL_SAVE_BATCHES == 0:
+            write_json(partial_path, {
+                "identity": identity, "windows": offset,
+                "batches": completed,
+                "error_sums": {k: v.tolist() for k, v in sums.items()},
+                "edge_windows": edges,
+            })
+        if smoke_batches and completed >= smoke_batches:
+            break
+    if completed == 0:
+        raise ValueError("Interpolation test dataset has no batches.")
+    result = {
+        "identity": identity, "windows": offset, "batches": completed,
+        "method": "linear between adjacent visible frames; edge hold",
+        "error_sums": {k: v.tolist() for k, v in sums.items()},
+        "edge_windows": edges,
+    }
+    if smoke_batches is None:
+        for duration in durations:
+            expected = conditions[str(duration)]
+            if (
+                offset != expected["windows"]
+                or completed != expected["batches"]
+            ):
+                raise ValueError("Interpolation and model membership differ.")
+            counts = [row[0] for row in expected["frequency_sums"]]
+            if any(count != offset * duration for count in counts):
+                raise ValueError("Temporal condition mask counts differ.")
+        write_json(result_path, result)
+        partial_path.unlink(missing_ok=True)
+    return result
+
+
+def plot_interpolation(
+    result: dict, root: Path, axis: Sequence[float], reports: Path,
+    fit: Path, step: int, settings: Mapping,
+) -> None:
+    """Publish paired relative L1 curves and frequency-level source table."""
+    import json
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    from .reporting import Report
+
+    report = Report(reports, fit, step, [], settings)
+    index = reports / "output_index.csv"
+    if index.exists():
+        report.entries = pd.read_csv(index).to_dict("records")
+    rows = []
+    for duration in result["identity"]["configuration"]["durations_frames"]:
+        saved = json.loads(
+            (root / "conditions" / f"temporal_{duration}.json").read_text()
+        )
+        frame_rows = []
+        for hz, model, baseline in zip(
+            axis, saved["frequency_sums"], result["error_sums"][str(duration)]
+        ):
+            ratio = model[1] / baseline if baseline > 0 else None
+            if ratio is None:
+                warnings.warn("Interpolation L1 is zero; ratio is undefined.")
+            frame_rows.append({
+                "duration_frames": duration, "frequency_hz": hz,
+                "count": model[0], "model_error_sum": model[1],
+                "interpolation_error_sum": baseline,
+                "interpolation_l1": baseline / model[0],
+                "model_l1": model[1] / model[0], "relative_l1": ratio,
+            })
+        frame = pd.DataFrame(frame_rows)
+        rows.extend(frame_rows)
+        fig, ax = plt.subplots(figsize=(13, 8))
+        ax.plot(
+            frame.frequency_hz, frame.relative_l1,
+            color="#0072B2", lw=2.5, label="BrainBERT",
+        )
+        ax.axhline(1, color="0.5", ls="--", lw=2.5,
+                   label="Temporal interpolation")
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("L1 / interpolation L1")
+        ms = duration * result["identity"]["configuration"]["frame_hop_ms"]
+        report.figure(
+            f"test/fixed_masks/interpolation/frequency/duration_{duration}",
+            fig, f"Temporal reconstruction: {duration} frames ({ms:.0f} ms); "
+            f"validation-selected checkpoint {step}",
+        )
+        fig, ax = plt.subplots(figsize=(13, 8))
+        ax.plot(
+            frame.frequency_hz, frame.interpolation_l1,
+            color="0.4", lw=2.5, label="Temporal interpolation",
+        )
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("Interpolation L1 (normalized targets)")
+        report.figure(
+            f"test/fixed_masks/interpolation/frequency/baseline_{duration}",
+            fig, f"Interpolation error: {duration} frames ({ms:.0f} ms)",
+        )
+    report.table(
+        "test/fixed_masks/interpolation/frequency/reconstruction",
+        pd.DataFrame(rows),
+        "Temporal reconstruction relative to local interpolation",
+    )
+    print(f"Interpolation reports saved: {reports.resolve()}", flush=True)

@@ -91,3 +91,11 @@ reduction order. Loader concurrency is controlled by `--workers`. Device and
 worker choices do not alter diagnostic identity. Training-baseline and test
 accumulators are saved every 16 batches, so interrupted diagnostic work can
 resume without retaining predictions or additional model checkpoints.
+
+
+For a temporal-only comparison against a local baseline, replay the fixed-mask
+profile with `--interpolation`. The baseline linearly interpolates between the
+nearest visible frames in each frequency bin. If a mask touches a window edge,
+it holds the one available endpoint; the diagnostic JSON records these cases.
+The comparison reuses saved model errors, uses exactly the original test masks,
+and saves relative L1 figures and source tables under `fixed_masks/interpolation`.

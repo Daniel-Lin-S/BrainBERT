@@ -49,6 +49,7 @@ def repair(
     evaluation_config: Path | None = None,
     evaluation_name: str | None = None,
     devices: list[str] | None = None,
+    interpolation: bool = False,
 ) -> None:
     """Replay pinned test batches with bounded resources and atomic outputs.
 
@@ -222,6 +223,31 @@ def repair(
             from .fixed_mask_diagnostics import evaluate_fixed, plot_fixed
             from .storage import digest
 
+            fixed_options = OmegaConf.to_container(fixed, resolve=True)
+            fixed_identity = {
+                "checkpoint_sha256": checkpoint_hash,
+                "selection_sha256": digest(task.dataset.selection_manifest),
+                "checkpoint_step": state["completed_steps"],
+            }
+            if interpolation:
+                from .fixed_mask_diagnostics import (
+                    evaluate_interpolation, plot_interpolation,
+                )
+
+                root = campaign_root / "diagnostics" / "fixed_masks"
+                result = evaluate_interpolation(
+                    task, fixed_options, root, fixed_identity, workers,
+                    progress, cfg.exp.runner.valid_batch_size, smoke_batches,
+                )
+                if smoke_batches is None:
+                    plot_interpolation(
+                        result, root, task.dataset.extracter.frequency_axis(),
+                        reports, fit, state["completed_steps"], settings,
+                    )
+                write_json(status_path, {
+                    "phase": "complete", "stages": stages, "fit_id": fit_id,
+                })
+                return
             outputs = evaluate_fixed(
                 task, model, cfg, OmegaConf.to_container(fixed, resolve=True),
                 campaign_root / "diagnostics" / "fixed_masks",
@@ -492,6 +518,7 @@ def main() -> None:
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--campaign", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--interpolation", action="store_true")
     parser.add_argument("--devices", nargs="+")
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--smoke-batches", type=int)
@@ -511,6 +538,7 @@ def main() -> None:
         args.evaluation_config,
         args.evaluation_name,
         args.devices,
+        args.interpolation,
     )
 
 

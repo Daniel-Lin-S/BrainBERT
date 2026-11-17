@@ -129,3 +129,40 @@ def test_training_baseline_partial_resume(tmp_path):
     assert first == resumed
     assert first["mean"] == [39.5, 39.5]
     assert first["frame_count"] == 240
+
+
+
+def test_temporal_interpolation_and_boundary_hold():
+    """Use only the nearest visible endpoints and count edge gaps."""
+    from util.experiments.fixed_mask_diagnostics import linear_temporal_errors
+
+    target = torch.tensor([
+        [[0.], [1.], [2.], [3.], [4.]],
+        [[2.], [3.], [4.], [5.], [6.]],
+    ])
+    mask = torch.zeros_like(target, dtype=torch.bool)
+    mask[0, 1:4] = True
+    mask[1, 0:2] = True
+    errors, edge = linear_temporal_errors(
+        target, torch.zeros(2, 5, dtype=torch.bool), mask,
+    )
+    assert edge == 1
+    assert torch.equal(errors, torch.tensor([3.], dtype=torch.float64))
+    altered = target.clone()
+    altered[0, 1:4] += 10
+    changed, _ = linear_temporal_errors(
+        altered, torch.zeros(2, 5, dtype=torch.bool), mask,
+    )
+    assert torch.equal(changed, torch.tensor([33.], dtype=torch.float64))
+
+
+def test_temporal_interpolation_rejects_invalid_masks():
+    """All masked cells must have available visible context."""
+    from util.experiments.fixed_mask_diagnostics import linear_temporal_errors
+
+    target = torch.ones(1, 4, 2)
+    with pytest.raises(ValueError, match="endpoint"):
+        linear_temporal_errors(
+            target, torch.zeros(1, 4, dtype=torch.bool),
+            torch.ones_like(target, dtype=torch.bool),
+        )
