@@ -55,7 +55,7 @@ Replacement actions describe writes, not guaranteed value changes: a random
 replacement can coincidentally equal the original value.
 
 To reevaluate an existing checkpoint, add `--evaluation-config` and
-`--evaluation-name zero_only_v1` or `random_only_v1` to the test-diagnostics
+`--evaluation-name zero_only` or `random_only` to the test-diagnostics
 command. Each evaluation retains the frozen test-window membership and writes
 its own results, monitor tables, policy, checkpoint digest and completion
 checksums under the campaign's `evaluations/<name>` directory. Derived reports
