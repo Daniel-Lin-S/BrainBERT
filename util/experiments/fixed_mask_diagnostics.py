@@ -845,6 +845,28 @@ def plot_interpolation(
         )
         fig, ax = plt.subplots(figsize=(13, 8))
         ax.plot(
+            frame.frequency_hz, frame.model_l1,
+            color="#0072B2", lw=2.5, label="BrainBERT",
+        )
+        ax.plot(
+            frame.frequency_hz, frame.interpolation_l1,
+            color="0.25", ls="--", lw=2.5,
+            label="Temporal interpolation",
+        )
+        ax.plot(
+            frame.frequency_hz, frame.constant_prediction_l1,
+            color="0.55", ls=":", lw=2.5,
+            label="Constant prediction L1",
+        )
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("L1 (normalized targets)")
+        report.figure(
+            f"test/fixed_masks/l1_by_frequency/duration_{duration}",
+            fig, f"Temporal reconstruction L1: {duration} frames "
+            f"({ms:.0f} ms); validation-selected checkpoint {step}",
+        )
+        fig, ax = plt.subplots(figsize=(13, 8))
+        ax.plot(
             frame.frequency_hz, frame.interpolation_l1,
             color="0.25", lw=2.5, label="Temporal interpolation",
         )

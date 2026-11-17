@@ -275,7 +275,7 @@ class Report:
             family = "mask_full_grid"
         elif "frequency_coverage/" in name:
             family = "frequency_coverage"
-        elif "/frequency/" in name:
+        elif "/frequency/" in name or "/l1_by_frequency/" in name:
             family = "frequency_errors"
         elif "/representation/" in name:
             family = "representation_rank"
