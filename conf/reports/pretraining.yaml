@@ -13,7 +13,6 @@ figures:
 - frequency_coverage
 - representation_rank
 - optimization
-- test_overview
 tables:
 - overall_metrics
 - objective_components

@@ -658,7 +658,7 @@ class TrainingMonitor:
                 )
             axes[1].axhline(1, color="gray", linestyle="--")
             axes[0].set_ylabel("L1 (standardized magnitude)")
-            axes[1].set_ylabel("L1 / zero baseline")
+            axes[1].set_ylabel("L1 / constant prediction L1")
             axes[1].set_xlabel("Frequency (Hz)")
             axes[1].set_xlim(
                 self.frequencies[0], self.frequencies[-1]

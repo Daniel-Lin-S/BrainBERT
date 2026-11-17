@@ -29,6 +29,26 @@ from .report_settings import report_settings, reports_requested
 from .monitoring import ACTIONS, STRATEGIES, SUM_FIELDS
 
 DPI = 300
+LEGEND_FONT_SIZE = 20
+EPOCH_FONT_SIZE = 16
+TITLE_FONT_SIZE = 22
+LABEL_FONT_SIZE = 20
+TICK_FONT_SIZE = 18
+LINE_STYLES = {
+    "train": "-",
+    "validation": "--",
+    "test": "-.",
+    "temporal_only": "-",
+    "spectral_only": "--",
+    "overlap": "-.",
+    "zero": "-",
+    "random": "--",
+    "unchanged": "-.",
+    "all": ":",
+    "temporal": ":",
+    "spectral": ":",
+    "union": "--",
+}
 COLORS = {
     "train": "#0173b2",
     "validation": "#de8f05",
@@ -40,6 +60,9 @@ COLORS = {
     "random": "#d55e00",
     "unchanged": "#56b4e9",
     "all": "#333333",
+    "temporal": "#56b4e9",
+    "spectral": "#f0b35a",
+    "union": "#777777",
 }
 HIDDEN_SUMS = set(SUM_FIELDS) - {"count", "content_count"}
 METRICS = ("l1", "content_l1", "relative_l1", "relative_content_l1")
@@ -47,8 +70,8 @@ LABELS = {
     "total_loss": "Total loss",
     "l1": "L1",
     "content_l1": "Content L1",
-    "relative_l1": "L1 / zero-baseline L1",
-    "relative_content_l1": "Content L1 /\nzero-baseline content L1",
+    "relative_l1": "L1 /\nconstant prediction L1",
+    "relative_content_l1": "Content L1 /\nconstant prediction L1 (content)",
     "std_ratio": "Prediction / target\nstandard deviation",
     "effective_rank": "Effective rank",
     "effective_rank_fraction": "Effective rank / attainable rank",
@@ -67,6 +90,10 @@ TABLES = (
 PHASES = ("train", "validation", "test")
 FOLDERS = {"train": "training", "validation": "validation", "test": "test"}
 DISPLAY = {
+    "gradient_norm_mean": "Interval mean",
+    "gradient_norm_max": "Interval maximum",
+    "clipping_fraction": "Clipped updates",
+    "lr_group_0_last_used": "Learning rate",
     "temporal_only": "Temporal only",
     "spectral_only": "Spectral only",
     "overlap": "Overlap",
@@ -74,6 +101,9 @@ DISPLAY = {
     "random": "Random",
     "unchanged": "Unchanged",
     "all": "Overall",
+    "temporal": "Temporal (incl. overlap)",
+    "spectral": "Spectral (incl. overlap)",
+    "union": "Any selection",
 }
 
 
@@ -212,7 +242,18 @@ class Report:
         self.epochs = epochs
         self.entries = []
         self.root.mkdir(parents=True, exist_ok=True)
-        sns.set_theme(style="whitegrid", context="talk", font_scale=0.85)
+        sns.set_theme(
+            style="whitegrid",
+            context="talk",
+            rc={
+                "font.size": LABEL_FONT_SIZE,
+                "axes.labelsize": LABEL_FONT_SIZE,
+                "axes.titlesize": TITLE_FONT_SIZE,
+                "xtick.labelsize": TICK_FONT_SIZE,
+                "ytick.labelsize": TICK_FONT_SIZE,
+                "legend.fontsize": LEGEND_FONT_SIZE,
+            },
+        )
 
     def wants(self, kind: str, name: str) -> bool:
         """Select an output by its explicit format, family, and split."""
@@ -242,8 +283,6 @@ class Report:
             family = "objective_components"
         elif kind == "tables":
             family = "overall_metrics"
-        elif name.startswith("test/"):
-            family = "test_overview"
         else:
             family = "learning_curves"
         return family in self.settings[kind]
@@ -292,8 +331,46 @@ class Report:
             plt.close(fig)
             return
         path = figure_output(name)
-        fig.suptitle(textwrap.fill(meaning, 82), fontsize=18)
-        fig.tight_layout(rect=(0, 0, 1, 0.94))
+        for ax in fig.axes:
+            ax.set_ylabel(textwrap.fill(ax.get_ylabel().replace("\n", " "), 22))
+        has_epochs = any(
+            getattr(ax, "_report_epochs", False) for ax in fig.axes
+        )
+        has_legends = any(ax.get_legend_handles_labels()[1] for ax in fig.axes)
+        fig.tight_layout(
+            rect=(
+                0,
+                0.045 if has_epochs else 0,
+                1,
+                0.9 if has_legends else 0.94,
+            ),
+            h_pad=5 if has_legends else 2.5,
+            w_pad=2,
+        )
+        shared_legends(fig)
+        if has_epochs:
+            fig.text(
+                0.5,
+                0.012,
+                f"E1–E{len(self.epochs)}: completed epochs; "
+                "dotted line: selected checkpoint",
+                ha="center",
+                fontsize=LEGEND_FONT_SIZE,
+            )
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        tops = [ax.get_tightbbox(renderer).y1 for ax in fig.axes]
+        tops.extend(
+            legend.get_window_extent(renderer).y1 for legend in fig.legends
+        )
+        title_gap = TITLE_FONT_SIZE * fig.dpi / 72
+        title_y = (max(tops) + title_gap) / fig.bbox.height
+        fig.suptitle(
+            textwrap.fill(meaning, 75),
+            fontsize=TITLE_FONT_SIZE,
+            y=title_y,
+            va="bottom",
+        )
         try:
             atomic_write(
                 self.root / path,
@@ -309,17 +386,63 @@ class Report:
     def step_axis(self, ax: object) -> None:
         """Annotate actual optimizer steps and epoch boundaries."""
         ax.set_xlabel("Optimiser steps")
+        ax._report_epochs = True
         for epoch, step in enumerate(self.epochs, 1):
             ax.axvline(step, color="0.8", lw=0.8, zorder=0)
             ax.text(
                 step,
-                1.02,
+                0.98,
                 f"E{epoch}",
-                fontsize=9,
+                fontsize=EPOCH_FONT_SIZE,
                 transform=ax.get_xaxis_transform(),
                 ha="center",
+                va="top",
+                bbox={
+                    "facecolor": "white",
+                    "edgecolor": "none",
+                    "alpha": 0.85,
+                    "pad": 1,
+                },
             )
         ax.axvline(self.best, color="black", ls=":", lw=1.5)
+
+
+def shared_legends(fig: object) -> None:
+    """Share matching line legends across panels, keeping disjoint rows.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        Laid-out figure whose labeled artists define legend semantics.
+    """
+    groups = []
+    for ax in fig.axes:
+        handles, labels = ax.get_legend_handles_labels()
+        if not labels:
+            continue
+        entries = dict(zip(labels, handles))
+        matching = [g for g in groups if set(g["entries"]) & set(entries)]
+        if matching:
+            group = matching[0]
+            group["entries"].update(entries)
+            group["axes"].append(ax)
+        else:
+            groups.append({"entries": entries, "axes": [ax]})
+    for group in groups:
+        boxes = [ax.get_position() for ax in group["axes"]]
+        left = min(box.x0 for box in boxes)
+        right = max(box.x1 for box in boxes)
+        top = max(box.y1 for box in boxes)
+        entries = group["entries"]
+        fig.legend(
+            entries.values(),
+            entries.keys(),
+            loc="lower center",
+            bbox_to_anchor=((left + right) / 2, top + 0.01),
+            frameon=False,
+            fontsize=LEGEND_FONT_SIZE,
+            ncol=min(len(entries), 3),
+        )
 
 
 def line_panel(
@@ -334,6 +457,10 @@ def line_panel(
     if y not in frame:
         return
     groups = list(frame[group].drop_duplicates())
+    order = list(DISPLAY)
+    groups.sort(
+        key=lambda value: order.index(value) if value in order else len(order)
+    )
     colors = sns.color_palette("colorblind", max(len(groups), 3))
     styles = ("-", "--", "-.", ":")
     for index, value in enumerate(groups):
@@ -343,7 +470,7 @@ def line_panel(
             rows[y],
             label=DISPLAY.get(value, str(value)),
             color=COLORS.get(value, colors[index]),
-            ls=styles[index % len(styles)],
+            ls=LINE_STYLES.get(value, styles[index % len(styles)]),
             lw=2,
             marker="o" if value == "validation" else None,
             markersize=3,
@@ -351,13 +478,6 @@ def line_panel(
     if reference:
         ax.axhline(1, color="gray", ls="--", lw=1)
     ax.set_ylabel(LABELS.get(y, y.replace("_", " ")))
-    ax.legend(
-        frameon=False,
-        fontsize=10,
-        loc="lower left",
-        bbox_to_anchor=(0, 1.01),
-        ncol=min(len(groups), 3),
-    )
 
 
 def learning_figures(report: Report, history: dict) -> None:
@@ -399,7 +519,7 @@ def learning_figures(report: Report, history: dict) -> None:
         line_panel(ax, long, "step", "value", "monitor")
         report.step_axis(ax)
     axes[0].set_ylabel("Learning rate")
-    axes[1].set_ylabel("Gradient norm")
+    axes[1].set_ylabel("Gradient norm before clipping")
     threshold = json.loads((report_fit(report) / "scientific.json").read_text())
     axes[1].axhline(threshold["runner"]["grad_clip"], color="gray", ls="--")
     axes[2].set_ylabel("Clipping fraction")
@@ -482,12 +602,16 @@ def condition_figures(report: Report, history: dict) -> None:
                         ):
                             ax.plot(group.step, group[key], lw=2)
                             ax.set_title(
-                                f"{DISPLAY[strategy]} / {DISPLAY[action]}"
+                                textwrap.fill(
+                                    f"{DISPLAY[strategy]} / {DISPLAY[action]}",
+                                    32,
+                                )
                             )
-                            ax.set_ylabel(LABELS[key])
+                            ax.set_ylabel("")
                             if key.startswith("relative"):
                                 ax.axhline(1, color="gray", ls="--")
                             report.step_axis(ax)
+                        fig.supylabel(LABELS[key], fontsize=LABEL_FONT_SIZE)
                         report.figure(
                             f"{folder}/mask_conditions/full_grid/{key}_history",
                             fig,
@@ -502,7 +626,9 @@ def condition_figures(report: Report, history: dict) -> None:
                         else chosen.step.max()
                     )
                 ]
-                fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+                fig, axes = plt.subplots(
+                    2, 2, figsize=(20 if family == "full_grid" else 16, 12)
+                )
                 for ax, key in zip(axes.flat, METRICS):
                     if family == "full_grid":
                         grid = snapshot.pivot(
@@ -516,15 +642,29 @@ def condition_figures(report: Report, history: dict) -> None:
                             cmap="viridis",
                             ax=ax,
                             cbar_kws={"label": LABELS[key]},
+                            annot_kws={"fontsize": LABEL_FONT_SIZE},
                         )
+                        ax.tick_params(axis="both", labelrotation=0)
                         ax.set_xlabel("Replacement")
                         ax.set_ylabel("Strategy")
                     else:
-                        ax.scatter(snapshot[key], snapshot.condition, s=65)
+                        categories = [
+                            DISPLAY[strategy if action == "all" else action]
+                            for strategy, action in zip(
+                                snapshot.strategy, snapshot.action
+                            )
+                        ]
+                        ax.scatter(snapshot[key], categories, s=85)
+                        low, high = snapshot[key].min(), snapshot[key].max()
+                        if key.startswith("relative"):
+                            low, high = min(low, 1), max(high, 1)
+                        padding = (high - low) * 0.08
+                        if padding > 0:
+                            ax.set_xlim(low - padding, high + padding)
                         if key.startswith("relative"):
                             ax.axvline(1, color="gray", ls="--")
                         ax.set_xlabel(LABELS[key])
-                    ax.set_title(LABELS[key])
+                    ax.set_title(textwrap.fill(LABELS[key], 35))
                 report.figure(
                     f"{folder}/mask_conditions/{family}/selected_checkpoint",
                     fig,
@@ -599,14 +739,7 @@ def frequency_figures(
                     baseline.zero_baseline_l1,
                     color="gray",
                     ls=":",
-                    label="Overall zero baseline",
-                )
-                ax.legend(
-                    frameon=False,
-                    fontsize=9,
-                    loc="lower left",
-                    bbox_to_anchor=(0, 1.01),
-                    ncol=3,
+                    label="constant prediction L1",
                 )
             ax.set_xlabel("Frequency (Hz)")
         report.figure(
@@ -758,39 +891,8 @@ def export_tables(report: Report, history: dict) -> None:
     report.table(
         "test/overall/objective",
         pd.DataFrame(result),
-        "Actual objective and matching zero-prediction objective",
+        "Actual objective and matching constant-prediction objective",
     )
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    for ax, key in zip(axes, ("relative_l1", "relative_content_l1")):
-        ax.scatter([row[key]], ["Overall"], s=80)
-        ax.axvline(1, color="gray", ls="--")
-        ax.set_xlabel(LABELS[key])
-    report.figure(
-        "test/overall/relative_errors",
-        fig,
-        "Held-out reconstruction relative to zero prediction",
-    )
-    test_rank_figure(report, history)
-
-
-def test_rank_figure(report: Report, history: dict) -> None:
-    """Publish rank diagnostics independently of already-ready figures."""
-    if "test_rank" in history and report.wants(
-        "figures", "test/representation/rank"
-    ):
-        rank = history["test_rank"].iloc[-1]
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        for ax, key in zip(
-            axes,
-            ("effective_rank", "effective_rank_fraction", "pca95_components"),
-        ):
-            ax.scatter(["Test"], [rank[key]], s=80)
-            ax.set_ylabel(LABELS[key])
-        report.figure(
-            "test/representation/rank",
-            fig,
-            "Test pooled-embedding diversity at the selected checkpoint",
-        )
 
 
 def render(
@@ -860,7 +962,6 @@ def render(
                 "tables/test/representation/rank.csv",
                 "Test rank uses the validation calculation",
             )
-        test_rank_figure(report, history)
         frequency_figures(
             report, history, phases=("test",), coverage_enabled=False
         )

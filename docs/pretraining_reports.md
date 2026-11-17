@@ -35,3 +35,9 @@ calculation. The rank calculation samples up to 2,048 evenly spaced windows.
 ratios use pooled cell totals. Histories use actual optimizer steps and discard
 superseded unsaved intervals after checkpoint restoration. Figures describe one
 fit and do not establish statistically significant model differences.
+
+Single-checkpoint test rank and overall relative errors are exported as CSV
+tables only. Validation rank remains a figure showing its training trajectory.
+Figure legends are shared across panels with matching series. E1, E2, etc.
+mark completed epochs; the dotted vertical line marks the selected checkpoint.
+The constant prediction L1 baseline predicts zero at every standardized cell.

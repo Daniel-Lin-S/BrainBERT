@@ -712,6 +712,6 @@ def test_tensorboard_toggle_keeps_scientific_identity():
     cfg.exp.runner.test_diagnostics = ["representation_rank", "frequency_errors"]
     cfg.exp.runner.reports = {
         "formats": ["png", "csv"], "splits": ["test"],
-        "figures": ["test_overview"], "tables": ["overall_metrics"],
+        "figures": ["mask_margins"], "tables": ["overall_metrics"],
     }
     assert before == scientific_config(cfg, dataset, {})

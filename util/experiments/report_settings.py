@@ -16,7 +16,6 @@ FIGURE_FAMILIES = frozenset(
         "frequency_coverage",
         "representation_rank",
         "optimization",
-        "test_overview",
     }
 )
 TABLE_FAMILIES = frozenset(
