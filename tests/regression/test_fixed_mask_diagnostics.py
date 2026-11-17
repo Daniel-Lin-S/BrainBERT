@@ -71,3 +71,61 @@ def test_target_only_copy_preserves_original_recipe(monkeypatch):
     )
     assert torch.equal(result["target"], features)
     assert not result["mask_label"].any()
+
+
+class _DiagnosticModel(torch.nn.Module):
+    """Deterministic inexpensive reconstruction for scheduler checks."""
+
+    def forward(self, values, padding):
+        return values * 0.5, None
+
+
+class _DiagnosticTask:
+    """Use ordinary dictionary collation for tiny synthetic targets."""
+
+    def get_batch_iterator(self, dataset, size, **kwargs):
+        return torch.utils.data.DataLoader(dataset, size, **kwargs)
+
+
+def test_shared_stream_matches_serial_and_resumes(tmp_path):
+    """Device scheduling and resumption preserve batch reduction order."""
+    from util.experiments.fixed_mask_diagnostics import evaluate_conditions
+
+    torch.set_num_threads(1)
+    dataset = [{
+        "target": torch.arange(80).reshape(20, 4).float() + 2,
+        "attn_mask": torch.zeros(20, dtype=torch.bool),
+    } for _ in range(80)]
+    conditions = [("spectral", "spectral", 0),
+                  ("temporal_4", "temporal", 4),
+                  ("joint_4", "joint", 4)]
+    bins = balanced_bins(80, 4, 0)
+
+    def run(devices, root):
+        return evaluate_conditions(
+            _DiagnosticTask(), dataset, _DiagnosticModel(), devices,
+            conditions, bins, torch.ones(4), [4, 8, 14], 0, 2.,
+            4, 0, root, {"test": "paired"}, lambda *args: None, None,
+        )
+
+    serial = run(["cpu"], tmp_path / "serial")
+    parallel = run(["cpu", "cpu:0"], tmp_path / "parallel")
+    resumed = run(["cpu"], tmp_path / "parallel")
+    assert serial == parallel == resumed
+
+
+def test_training_baseline_partial_resume(tmp_path):
+    """Resumed training means equal a direct mean over all valid targets."""
+    from util.experiments.fixed_mask_diagnostics import training_baseline
+
+    dataset = [{
+        "target": torch.full((3, 2), float(i)),
+        "attn_mask": torch.zeros(3, dtype=torch.bool),
+    } for i in range(80)]
+    args = (_DiagnosticTask(), dataset, 4, 0, tmp_path, {"test": "mean"},
+            lambda *args: None, None)
+    first = training_baseline(*args)
+    resumed = training_baseline(*args)
+    assert first == resumed
+    assert first["mean"] == [39.5, 39.5]
+    assert first["frame_count"] == 240

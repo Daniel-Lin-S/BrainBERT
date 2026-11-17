@@ -15,6 +15,8 @@ import torch
 
 from criterions.pretrain_masked_criterion import CONTENT_THRESHOLD
 
+PARTIAL_SAVE_BATCHES = 16
+
 MASK_TYPES = ("temporal", "spectral", "joint")
 SUM_COLUMNS = (
     "count", "error_sum", "baseline_sum", "content_count",
@@ -167,6 +169,7 @@ def evaluate_fixed(
     options: Mapping, root: Path, identity: dict, device: str,
     workers: int, progress: Callable, smoke_batches: int | None = None,
     publish: Callable | None = None,
+    devices: Sequence[str] | None = None,
 ) -> dict:
     """Replay fixed test conditions and persist small resumable summaries.
 
@@ -191,6 +194,9 @@ def evaluate_fixed(
 
     publish : callable or None, optional
         Publish ready summaries after each condition, default None.
+
+    devices : sequence of str or None, optional
+        Independent inference devices; default uses device alone.
 
     Returns
     -------
@@ -227,38 +233,21 @@ def evaluate_fixed(
             raise ValueError("Saved training baseline provenance differs.")
         mean = torch.tensor(baseline["mean"], dtype=torch.float64)
     else:
-        loader = task.get_batch_iterator(
-            training_targets, size, shuffle=False, num_workers=workers
+        baseline = training_baseline(
+            task, training_targets, size, workers, root, identity,
+            progress, smoke_batches,
         )
-        sums, count = None, 0
-        for batch_index, batch in enumerate(loader):
-            target = batch["target"].double()
-            valid = ~batch["attn_mask"].bool()
-            if not torch.isfinite(target).all():
-                raise ValueError("Training baseline targets must be finite.")
-            value = (target * valid[:, :, None]).sum((0, 1))
-            sums = value if sums is None else sums + value
-            count += int(valid.sum())
-            progress(batch_index + 1, len(loader), "training_baseline")
-            if smoke_batches and batch_index + 1 >= smoke_batches:
-                break
-        if count == 0:
-            raise ValueError("Training baseline has no valid target frames.")
-        mean = sums / count
-        baseline = {
-            "identity": identity, "mean": mean.tolist(),
-            "frame_count": count,
-            "source": "normalized training targets; all valid frames",
-        }
+        mean = torch.tensor(baseline["mean"], dtype=torch.float64)
         if smoke_batches is None:
             write_json(baseline_path, baseline)
+            (root / "training_baseline_partial.json").unlink(missing_ok=True)
     frequencies = len(mean)
     bins = balanced_bins(len(task.test_set), frequencies, options["seed"])
     conditions = [("spectral", 0)] + [
         (kind, duration) for duration in durations
         for kind in ("temporal", "joint")
     ]
-    outputs = {}
+    outputs, pending = {}, []
     for kind, duration in conditions:
         name = f"{kind}_{duration}" if duration else kind
         path = root / "conditions" / f"{name}.json"
@@ -268,53 +257,207 @@ def evaluate_fixed(
                 raise ValueError(f"Saved condition provenance differs: {name}")
             outputs[name] = saved
             progress(saved["batches"], saved["batches"], name)
-            continue
-        loader = task.get_batch_iterator(
-            test_targets, size, shuffle=False, num_workers=workers
+        else:
+            pending.append((name, kind, duration))
+    if pending:
+        evaluated = evaluate_conditions(
+            task, test_targets, model, devices or [device], pending,
+            bins, mean, durations, options["seed"], cfg.criterion.alpha,
+            size, workers, root, identity, progress, smoke_batches,
         )
-        objectives = torch.zeros(6, dtype=torch.float64)
-        frequency = torch.zeros(frequencies, 6, dtype=torch.float64)
-        offset = 0
-        for batch_index, batch in enumerate(loader):
-            target = batch["target"].to(device)
-            padding = batch["attn_mask"].to(device).bool()
-            indices = torch.arange(offset, offset + len(target))
-            temporal, spectral = fixed_masks(
-                padding, frequencies, indices, duration or min(durations),
-                max(durations), bins, options["seed"],
-            )
-            if kind == "temporal":
-                selected = scored = temporal
-            elif kind == "spectral":
-                selected = scored = spectral
-            else:
-                selected, scored = temporal | spectral, temporal & spectral
-            prediction, _ = model(target.masked_fill(selected, 0), padding)
-            objective, sums = reconstruction_statistics(
-                prediction, target, selected, scored, mean.to(device),
-                cfg.criterion.alpha,
-            )
-            objectives += objective
-            frequency += sums
-            offset += len(target)
-            progress(batch_index + 1, len(loader), name)
-            if smoke_batches and batch_index + 1 >= smoke_batches:
-                break
-        completed = batch_index + 1
-        saved = {
-            "identity": identity, "baseline": baseline,
-            "mask": kind, "duration_frames": duration,
-            "batches": completed, "windows": offset,
-            "objective_means": (objectives / completed).tolist(),
-            "frequency_sums": frequency.tolist(),
-        }
-        if smoke_batches is None:
-            write_json(path, saved)
-        outputs[name] = saved
-        if publish is not None and smoke_batches is None:
-            publish(outputs)
-        print(f"Completed fixed-mask condition: {name}", flush=True)
+        for name, kind, duration in pending:
+            result = evaluated[name]
+            saved = {
+                "identity": identity, "baseline": baseline,
+                "mask": kind, "duration_frames": duration, **result,
+            }
+            if smoke_batches is None:
+                write_json(root / "conditions" / f"{name}.json", saved)
+            outputs[name] = saved
+            if publish is not None and smoke_batches is None:
+                publish(outputs)
+    if smoke_batches is None:
+        (root / "test_partial.json").unlink(missing_ok=True)
     return outputs
+
+
+@torch.inference_mode()
+def training_baseline(
+    task: Any, dataset: Any, size: int, workers: int, root: Path,
+    identity: dict, progress: Callable, smoke_batches: int | None,
+) -> dict:
+    """Stream training targets once, retaining resumable frequency sums.
+
+    Dataset entries contain targets (T, F); the result contains a frozen
+    mean (F,), valid-frame count and the exact selection identity. Partial
+    sums are checkpointed every PARTIAL_SAVE_BATCHES batches. Smoke runs
+    never read or write scientific baseline artifacts.
+    """
+    import json
+    import math
+    from .storage import write_json
+
+    partial_path = root / "training_baseline_partial.json"
+    offset, count, sums = 0, 0, None
+    if partial_path.exists() and smoke_batches is None:
+        partial = json.loads(partial_path.read_text())
+        if partial["identity"] != identity:
+            raise ValueError("Partial training baseline provenance differs.")
+        offset, count = partial["windows"], partial["count"]
+        sums = torch.tensor(partial["sums"], dtype=torch.float64)
+    total = math.ceil(len(dataset) / size)
+    subset = torch.utils.data.Subset(dataset, range(offset, len(dataset)))
+    loader = task.get_batch_iterator(
+        subset, size, shuffle=False, num_workers=workers,
+    )
+    completed = offset // size
+    for batch in loader:
+        target = batch["target"].double()
+        valid = ~batch["attn_mask"].bool()
+        if not torch.isfinite(target).all():
+            raise ValueError("Training baseline targets must be finite.")
+        value = (target * valid[:, :, None]).sum((0, 1))
+        sums = value if sums is None else sums + value
+        count += int(valid.sum())
+        offset += len(target)
+        completed += 1
+        progress(completed, total, "training_baseline")
+        if smoke_batches is None and completed % PARTIAL_SAVE_BATCHES == 0:
+            write_json(partial_path, {
+                "identity": identity, "windows": offset,
+                "count": count, "sums": sums.tolist(),
+            })
+        if smoke_batches and completed >= smoke_batches:
+            break
+    if count == 0:
+        raise ValueError("Training baseline has no valid target frames.")
+    return {
+        "identity": identity, "mean": (sums / count).tolist(),
+        "frame_count": count,
+        "source": "normalized training targets; all valid frames",
+    }
+
+
+@torch.inference_mode()
+def condition_batch(
+    model: torch.nn.Module, device: str, conditions: list,
+    batch: dict, indices: torch.Tensor, bins: torch.Tensor,
+    mean: torch.Tensor, durations: list[int], seed: int, alpha: float,
+) -> dict:
+    """Evaluate assigned conditions using one device-local target transfer.
+
+    Returns objective sums (6,) and frequency sums (F, 6) for each condition.
+    Each worker owns a model replica; no gradient communication is needed.
+    """
+    target = batch["target"].to(device)
+    padding = batch["attn_mask"].to(device).bool()
+    mean = mean.to(device)
+    results = {}
+    for name, kind, duration in conditions:
+        temporal, spectral = fixed_masks(
+            padding, len(mean), indices, duration or min(durations),
+            max(durations), bins, seed,
+        )
+        if kind == "temporal":
+            selected = scored = temporal
+        elif kind == "spectral":
+            selected = scored = spectral
+        else:
+            selected, scored = temporal | spectral, temporal & spectral
+        prediction, _ = model(target.masked_fill(selected, 0), padding)
+        results[name] = reconstruction_statistics(
+            prediction, target, selected, scored, mean, alpha,
+        )
+    return results
+
+
+@torch.inference_mode()
+def evaluate_conditions(
+    task: Any, dataset: Any, model: torch.nn.Module,
+    devices: Sequence[str], conditions: list, bins: torch.Tensor,
+    mean: torch.Tensor, durations: list[int], seed: int, alpha: float,
+    size: int, workers: int, root: Path, identity: dict,
+    progress: Callable, smoke_batches: int | None,
+) -> dict:
+    """Share one test stream among independent device-owned conditions.
+
+    Partial artifacts contain only aggregate objective and frequency sums;
+    no predictions or targets are saved. Batch ordering and reduction order
+    match serial evaluation, independent of device count.
+    """
+    import copy
+    import json
+    import math
+    from concurrent.futures import ThreadPoolExecutor
+    from .storage import write_json
+
+    if not devices or len(set(devices)) != len(devices):
+        raise ValueError("Expected a nonempty list of distinct devices.")
+    selected_devices = list(devices[:len(conditions)])
+    replicas = [model.to(selected_devices[0])]
+    replicas.extend(
+        copy.deepcopy(model).to(device).eval()
+        for device in selected_devices[1:]
+    )
+    groups = [conditions[i::len(replicas)] for i in range(len(replicas))]
+    sums = {
+        name: (torch.zeros(6, dtype=torch.float64),
+               torch.zeros(len(mean), 6, dtype=torch.float64))
+        for name, _, _ in conditions
+    }
+    partial_path = root / "test_partial.json"
+    offset, completed = 0, 0
+    if partial_path.exists() and smoke_batches is None:
+        saved = json.loads(partial_path.read_text())
+        if saved["identity"] != identity:
+            raise ValueError("Partial fixed-mask test provenance differs.")
+        if set(sums) <= set(saved["sums"]):
+            offset, completed = saved["windows"], saved["batches"]
+            sums = {
+                name: tuple(torch.tensor(x, dtype=torch.float64) for x in
+                            saved["sums"][name]) for name in sums
+            }
+    subset = torch.utils.data.Subset(dataset, range(offset, len(dataset)))
+    loader = task.get_batch_iterator(
+        subset, size, shuffle=False, num_workers=workers,
+    )
+    total = math.ceil(len(dataset) / size)
+    # Start loader processes before starting inference threads.
+    iterator = iter(loader)
+    with ThreadPoolExecutor(max_workers=len(replicas)) as executor:
+        for batch in iterator:
+            indices = torch.arange(offset, offset + len(batch["target"]))
+            futures = [executor.submit(
+                condition_batch, replica, device, group, batch, indices,
+                bins, mean, durations, seed, alpha,
+            ) for replica, device, group in zip(
+                replicas, selected_devices, groups,
+            )]
+            for future in futures:
+                for name, (objective, frequency) in future.result().items():
+                    sums[name][0].add_(objective)
+                    sums[name][1].add_(frequency)
+                    progress(completed + 1, total, name)
+            offset += len(batch["target"])
+            completed += 1
+            if smoke_batches is None and completed % PARTIAL_SAVE_BATCHES == 0:
+                write_json(partial_path, {
+                    "identity": identity, "windows": offset,
+                    "batches": completed,
+                    "sums": {name: [x.tolist() for x in values]
+                             for name, values in sums.items()},
+                })
+            if smoke_batches and completed >= smoke_batches:
+                break
+    if completed == 0:
+        raise ValueError("Fixed-mask test benchmark contains no batches.")
+    return {
+        name: {
+            "batches": completed, "windows": offset,
+            "objective_means": (values[0] / completed).tolist(),
+            "frequency_sums": values[1].tolist(),
+        } for name, values in sums.items()
+    }
 
 
 

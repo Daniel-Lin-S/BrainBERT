@@ -83,3 +83,11 @@ frequency; joint curves score the time–frequency intersection. Small condition
 summaries and the training mean are cached under campaign diagnostics for
 resumption. Figures share `reports/figures/test/fixed_masks/frequency`;
 source tables reside under `reports/tables/test/fixed_masks`.
+
+
+For independent condition inference, pass explicit CUDA IDs with `--devices`.
+All conditions share one test-data stream and retain the original batch
+reduction order. Loader concurrency is controlled by `--workers`. Device and
+worker choices do not alter diagnostic identity. Training-baseline and test
+accumulators are saved every 16 batches, so interrupted diagnostic work can
+resume without retaining predictions or additional model checkpoints.

@@ -48,6 +48,7 @@ def repair(
     report_config: Path | None = None,
     evaluation_config: Path | None = None,
     evaluation_name: str | None = None,
+    devices: list[str] | None = None,
 ) -> None:
     """Replay pinned test batches with bounded resources and atomic outputs.
 
@@ -167,9 +168,16 @@ def repair(
     if not torch.cuda.is_available() or not device.startswith("cuda"):
         raise RuntimeError("Test replay requires an available CUDA device.")
     torch.set_num_threads(2)
-    torch.cuda.set_per_process_memory_fraction(
-        GPU_MEMORY_FRACTION, torch.device(device)
-    )
+    selected_devices = devices or [device]
+    if len(set(selected_devices)) != len(selected_devices):
+        raise ValueError("Diagnostic devices must be distinct.")
+    for selected_device in selected_devices:
+        if not selected_device.startswith("cuda:"):
+            raise ValueError("Diagnostic devices must be explicit CUDA IDs.")
+        torch.cuda.set_per_process_memory_fraction(
+            GPU_MEMORY_FRACTION, torch.device(selected_device)
+        )
+    device = selected_devices[0]
     invocation = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     invocation += "-diagnostics-" + uuid.uuid4().hex[:8]
     logs = Path(cfg.storage.logs).resolve() / campaign / invocation
@@ -225,6 +233,7 @@ def repair(
                     "checkpoint_step": state["completed_steps"],
                 },
                 device, workers, progress, smoke_batches,
+                devices=selected_devices,
                 publish=lambda ready: plot_fixed(
                     ready, task.dataset.extracter.frequency_axis(),
                     float(fixed.frame_hop_ms), reports, fit,
@@ -483,6 +492,7 @@ def main() -> None:
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--campaign", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--devices", nargs="+")
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--smoke-batches", type=int)
     parser.add_argument("--diagnostics-config", type=Path)
@@ -500,6 +510,7 @@ def main() -> None:
         args.report_config,
         args.evaluation_config,
         args.evaluation_name,
+        args.devices,
     )
 
 
