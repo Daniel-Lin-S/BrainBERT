@@ -11,6 +11,7 @@ records normalization and categorical semantics; no spectrograms are saved.
 """
 
 import csv
+from collections.abc import Mapping, Sequence
 import gzip
 import os
 import time
@@ -53,6 +54,8 @@ ORIGINAL_METRICS = (
     "zero_baseline_l1",
     "content_zero_baseline_l1",
 )
+DIAGNOSTICS = frozenset({"representation_rank", "frequency_errors"})
+RANK_SAMPLE_WINDOWS = 2048
 GROUPS = len(STRATEGIES) * len(ACTIONS)
 CONTEXT_FIELDS = {
     "phase",
@@ -271,6 +274,31 @@ def summarize_accumulator(
     return result
 
 
+def diagnostic_names(value: object) -> frozenset:
+    """Resolve explicit diagnostic names; missing or empty means disabled."""
+    if value is None or value == "" or (
+        isinstance(value, (Mapping, Sequence)) and len(value) == 0
+    ):
+        return frozenset()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError("test_diagnostics must be a list of diagnostic names.")
+    names = frozenset(value)
+    if names - DIAGNOSTICS:
+        raise ValueError(
+            f"Unknown test diagnostics: {sorted(names - DIAGNOSTICS)}"
+        )
+    return names
+
+
+def rank_positions(windows: int) -> np.ndarray:
+    """Select the same bounded, evenly spaced rank subset for any split."""
+    if windows < 2:
+        raise ValueError("Embedding rank requires at least two windows.")
+    return np.unique(np.linspace(
+        0, windows - 1, min(RANK_SAMPLE_WINDOWS, windows), dtype=int,
+    ))
+
+
 def embedding_rank(embeddings: np.ndarray) -> dict:
     """Measure diversity of centered validation window embeddings (N, D)."""
     values = np.asarray(embeddings, dtype=np.float64)
@@ -414,7 +442,7 @@ class TrainingMonitor:
         if table not in self.writers:
             stream = (
                 gzip.open(self.root / f"{table}.csv.gz", "xt", newline="")
-                if table == "validation_frequency"
+                if table.endswith("_frequency")
                 else (self.root / f"{table}.csv").open("x", newline="")
             )
             self.streams[table] = stream
@@ -533,22 +561,25 @@ class TrainingMonitor:
             self._heatmap(context, grid)
         self.flush()
 
-    def record_rank(self, step: int, embeddings: np.ndarray) -> None:
+    def record_rank(
+        self, step: int, embeddings: np.ndarray, phase: str = "validation"
+    ) -> None:
         """Save centered window-embedding rank at one validation update."""
         summary = embedding_rank(embeddings)
-        self._row("validation_rank", {"step": step, **summary})
+        self._row(f"{phase}_rank", {"step": step, **summary})
         if self.writer is not None:
             for name in (
                 "effective_rank", "effective_rank_fraction",
                 "pca95_components",
             ):
                 self.writer.add_scalar(
-                    f"validation/rank/{name}", summary[name], step
+                    f"{phase}/rank/{name}", summary[name], step
                 )
         self.flush()
 
     def record_frequency(
-        self, step: int, stats: Accumulator, plot_image: bool = False
+        self, step: int, stats: Accumulator, plot_image: bool = False,
+        phase: str = "validation",
     ) -> None:
         """Save validation reconstruction by STFT bin and mask strategy."""
         if stats.frequency is None:
@@ -562,7 +593,7 @@ class TrainingMonitor:
                 count, error, content, content_error, baseline, content_base = (
                     values
                 )
-                self._row("validation_frequency", {
+                self._row(f"{phase}_frequency", {
                     "step": step,
                     "frequency_hz": frequency_hz,
                     "strategy": strategy,
@@ -588,15 +619,15 @@ class TrainingMonitor:
             ratios = pooled[:, 4] > 0
             if np.any(selected):
                 self.writer.add_histogram(
-                    "validation/frequency/l1",
+                    f"{phase}/frequency/l1",
                     pooled[selected, 1] / pooled[selected, 0], step,
                 )
             if np.any(ratios):
                 self.writer.add_histogram(
-                    "validation/frequency/relative_l1",
+                    f"{phase}/frequency/relative_l1",
                     pooled[ratios, 1] / pooled[ratios, 4], step,
                 )
-        if self.writer is not None and plot_image:
+        if self.writer is not None and plot_image and phase == "validation":
             self._frequency_reconstruction_plot(step, pooled)
         self.flush()
 

@@ -23,10 +23,11 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from schedulers import build_scheduler
-from util.experiments.monitoring import Accumulator, TrainingMonitor
+from util.experiments.monitoring import (
+    Accumulator, TrainingMonitor, diagnostic_names, rank_positions,
+)
 from util.experiments.storage import atomic_write, write_json
 
-RANK_SAMPLE_WINDOWS = 2048
 STATUS_STEP_INTERVAL = 10
 
 log = logging.getLogger(__name__)
@@ -528,10 +529,7 @@ class Runner:
                     "Validation embedding rank requires at least two windows."
                 )
             else:
-                self.rank_indices = np.unique(np.linspace(
-                    0, windows - 1, min(RANK_SAMPLE_WINDOWS, windows),
-                    dtype=int,
-                ))
+                self.rank_indices = rank_positions(windows)
                 write_json(
                     self.monitor.root / "rank_subset.json",
                     {"validation_windows": windows,
@@ -622,9 +620,15 @@ class Runner:
             persistent_workers=self.cfg.num_workers > 0,
         )
 
+        diagnostics = diagnostic_names(self.cfg.get("test_diagnostics"))
         if self.task.cfg.name == "spec_pretrain":
             test_outs = self.task.get_valid_outs(
                 best_model, test_loader, self.criterion, self.device,
+                rank_indices=(
+                    rank_positions(len(self.task.test_set))
+                    if "representation_rank" in diagnostics else None
+                ),
+                collect_frequency="frequency_errors" in diagnostics,
                 progress_callback=lambda done, total:
                 self.report_progress("test", done, total),
             )
@@ -635,6 +639,16 @@ class Runner:
             )
             self.report_progress("test", len(test_loader), len(test_loader))
         if self.monitor is not None:
+            if "representation_rank" in diagnostics:
+                self.monitor.record_rank(
+                    self.best_step, test_outs.pop("rank_embeddings"),
+                    phase="test",
+                )
+            if "frequency_errors" in diagnostics:
+                self.monitor.record_frequency(
+                    self.best_step, test_outs["monitor_accumulator"],
+                    phase="test",
+                )
             self.monitor.record(
                 "test",
                 self.completed_steps,

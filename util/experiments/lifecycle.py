@@ -37,6 +37,8 @@ SCIENTIFIC_RUNNER = {
     "checkpoint_step",
 }
 OPERATIONAL_RUNNER = {
+    "test_diagnostics",
+    "reports",
     "device",
     "multi_gpu",
     "num_workers",
