@@ -50,6 +50,7 @@ def repair(
     evaluation_name: str | None = None,
     devices: list[str] | None = None,
     interpolation: bool = False,
+    training_content_config: Path | None = None,
 ) -> None:
     """Replay pinned test batches with bounded resources and atomic outputs.
 
@@ -94,7 +95,18 @@ def repair(
         if report_config
         else cfg.exp.runner.get("reports")
     )
-    if not diagnostics and evaluation_config is None and not fixed:
+    training_content = (
+        OmegaConf.load(training_content_config)
+        if training_content_config else None
+    )
+    if not training_content:
+        training_content = None
+    if interpolation and not fixed:
+        raise ValueError(
+            "Interpolation requires an explicit fixed-mask profile."
+        )
+    if (not diagnostics and evaluation_config is None and not fixed
+            and training_content is None):
         render(artifact_root, campaign, settings=settings)
         return
     evaluation = (
@@ -166,13 +178,16 @@ def repair(
         return
     if evaluation is None and not reports.joinpath("output_index.csv").exists():
         raise ValueError("Generate available saved-data reports before replay.")
-    if not torch.cuda.is_available() or not device.startswith("cuda"):
+    cpu_only = interpolation and evaluation is None
+    if not cpu_only and (
+        not torch.cuda.is_available() or not device.startswith("cuda")
+    ):
         raise RuntimeError("Test replay requires an available CUDA device.")
     torch.set_num_threads(2)
     selected_devices = devices or [device]
     if len(set(selected_devices)) != len(selected_devices):
         raise ValueError("Diagnostic devices must be distinct.")
-    for selected_device in selected_devices:
+    for selected_device in ([] if cpu_only else selected_devices):
         if not selected_device.startswith("cuda:"):
             raise ValueError("Diagnostic devices must be explicit CUDA IDs.")
         torch.cuda.set_per_process_memory_fraction(
@@ -216,9 +231,30 @@ def repair(
         task.dataset.verify_test(Path(cfg.data.pinned_test))
         task.dataset.prepare_selected(task.dataset.selection_manifest)
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        model = task.build_model(cfg.model)
-        task.load_model_weights(model, state["model"], False)
-        model.to(device).eval()
+        if training_content is not None:
+            from .fixed_mask_diagnostics import (
+                training_content_counts, plot_training_content,
+            )
+            from .storage import digest
+
+            result = training_content_counts(
+                task, cfg.task, OmegaConf.to_container(training_content),
+                campaign_root / "diagnostics",
+                {"fit_id": fit_id, "selection_sha256": digest(
+                    task.dataset.selection_manifest,
+                ), "task": OmegaConf.to_container(cfg.task, resolve=True)},
+                workers, cfg.exp.runner.valid_batch_size, progress,
+                smoke_batches,
+            )
+            if smoke_batches is None:
+                plot_training_content(
+                    result, task.dataset.extracter.frequency_axis(), reports,
+                    fit, state["completed_steps"], settings,
+                )
+        if not cpu_only:
+            model = task.build_model(cfg.model)
+            task.load_model_weights(model, state["model"], False)
+            model.to(device).eval()
         if fixed:
             from .fixed_mask_diagnostics import evaluate_fixed, plot_fixed
             from .storage import digest
@@ -238,6 +274,7 @@ def repair(
                 result = evaluate_interpolation(
                     task, fixed_options, root, fixed_identity, workers,
                     progress, cfg.exp.runner.valid_batch_size, smoke_batches,
+                    alpha=cfg.criterion.alpha,
                 )
                 if smoke_batches is None:
                     plot_interpolation(
@@ -524,6 +561,7 @@ def main() -> None:
     parser.add_argument("--smoke-batches", type=int)
     parser.add_argument("--diagnostics-config", type=Path)
     parser.add_argument("--report-config", type=Path)
+    parser.add_argument("--training-content-config", type=Path)
     parser.add_argument("--evaluation-config", type=Path)
     parser.add_argument("--evaluation-name")
     args = parser.parse_args()
@@ -539,6 +577,7 @@ def main() -> None:
         args.evaluation_name,
         args.devices,
         args.interpolation,
+        args.training_content_config,
     )
 
 

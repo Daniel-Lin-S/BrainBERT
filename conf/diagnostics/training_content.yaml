@@ -1,0 +1,4 @@
+# Explicit training-only count estimate; no model inference.
+sample_windows: 4096
+selection_seed: 0
+mask_seed: 0

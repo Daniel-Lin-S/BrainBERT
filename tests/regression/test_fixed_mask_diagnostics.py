@@ -147,13 +147,15 @@ def test_temporal_interpolation_and_boundary_hold():
         target, torch.zeros(2, 5, dtype=torch.bool), mask,
     )
     assert edge == 1
-    assert torch.equal(errors, torch.tensor([3.], dtype=torch.float64))
+    assert torch.equal(errors, torch.tensor([[3., 3.]], dtype=torch.float64))
     altered = target.clone()
     altered[0, 1:4] += 10
     changed, _ = linear_temporal_errors(
         altered, torch.zeros(2, 5, dtype=torch.bool), mask,
     )
-    assert torch.equal(changed, torch.tensor([33.], dtype=torch.float64))
+    assert torch.equal(
+        changed, torch.tensor([[33., 33.]], dtype=torch.float64),
+    )
 
 
 def test_temporal_interpolation_rejects_invalid_masks():
@@ -166,3 +168,64 @@ def test_temporal_interpolation_rejects_invalid_masks():
             target, torch.zeros(1, 4, dtype=torch.bool),
             torch.ones_like(target, dtype=torch.bool),
         )
+
+
+def test_frequency_losses_use_content_denominators_and_combined_baseline():
+    """Total-loss ratios are ratios of objectives, not sums of ratios."""
+    from util.experiments.fixed_mask_diagnostics import frequency_losses
+    import numpy as np
+
+    losses = frequency_losses([[10, 20, 40, 2, 8, 12]], 2.)
+    np.testing.assert_allclose(losses["model"], [[2, 4, 10]])
+    np.testing.assert_allclose(losses["constant"], [[4, 6, 16]])
+    np.testing.assert_allclose(losses["relative"], [[.5, 2 / 3, .625]])
+    with pytest.raises(ValueError, match="content cells"):
+        frequency_losses([[10, 20, 40, 0, 0, 0]], 2.)
+    with pytest.raises(ValueError, match="finite"):
+        frequency_losses([[10, float("nan"), 40, 2, 8, 12]], 2.)
+
+
+def test_interpolation_content_errors_exclude_noncontent_targets():
+    """The content baseline uses the same target-defined subset as training."""
+    from util.experiments.fixed_mask_diagnostics import linear_temporal_errors
+
+    target = torch.tensor([[[0.], [.5], [3.], [0.]]])
+    selected = torch.tensor([[[False], [True], [True], [False]]])
+    errors, edges = linear_temporal_errors(
+        target, torch.zeros(1, 4, dtype=torch.bool), selected,
+    )
+    assert edges == 0
+    assert torch.equal(errors, torch.tensor([[3.5, 3.]], dtype=torch.float64))
+
+
+def test_training_content_counts_only_selected_cells(tmp_path, monkeypatch):
+    """Subset estimates preserve RNG state and exclude unselected/padded cells."""
+    import random
+    from types import SimpleNamespace
+    from util.experiments.fixed_mask_diagnostics import training_content_counts
+
+    dataset = [{
+        "target": torch.tensor([[2., .5], [.5, 3.], [8., 8.]]),
+        "attn_mask": torch.tensor([False, False, True]),
+    } for _ in range(8)]
+    task = _DiagnosticTask()
+    task.train_set = dataset
+    monkeypatch.setattr("util.mask_utils.test_masked_dataset",
+                        lambda x, **kwargs: x)
+
+    def masks(values, cfg):
+        random.random()
+        return values, torch.tensor([[True, True], [True, False]])
+
+    monkeypatch.setattr("util.mask_utils.mask_inputs", masks)
+    options = {"sample_windows": 4, "selection_seed": 0, "mask_seed": 3}
+    state = random.getstate()
+    result = training_content_counts(
+        task, SimpleNamespace(), options, tmp_path, {"fit": "test"},
+        0, 2, lambda *args: None,
+    )
+    assert random.getstate() == state
+    assert result["selected_count"] == [8, 4]
+    assert result["content_count"] == [4, 0]
+    assert result["windows"] == 4
+    assert not result["historical_masks"]

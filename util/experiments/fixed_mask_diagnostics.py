@@ -1,9 +1,17 @@
-"""Fixed test masks and sufficient statistics for paired reconstruction.
+"""Reconstruction diagnostics and training content-count estimates.
 
-Inputs are normalized targets (batch, time, frequency) and padding (batch,
- time). Outputs contain batch objective means and per-frequency error sums;
-no predictions or spectrogram tensors are persisted. Training and validation
-mask generators are never modified.
+Inputs are normalised targets (B, T, F), padding (B, T), and saved condition
+summaries. Condition JSONs retain six batch objective means (model/constant
+L1, content L1, total_loss) and frequency sums ordered by SUM_COLUMNS.
+Interpolation JSON retains per-frequency all/content error sums and three
+batch objective means per duration. Training-content JSON records sampled
+window identity and selected/content counts (F,) from the original recipe.
+
+Reports group raw and constant-normalised frequency figures by metric,
+duration comparisons separately, and interpolation figures by metric.
+Tables retain counts, three losses and matched baseline ratios. No target
+or prediction tensors are persisted; completed scientific results and the
+training/validation mask generators are never modified.
 """
 
 import warnings
@@ -16,6 +24,17 @@ import torch
 from criterions.pretrain_masked_criterion import CONTENT_THRESHOLD
 
 PARTIAL_SAVE_BATCHES = 16
+LOSS_METRICS = ("l1", "content_l1", "total_loss")
+LOSS_LABELS = ("L1", "Content L1", "Total loss")
+BASELINE_LABELS = (
+    "Constant prediction L1", "Constant prediction L1 (content)",
+    "Constant prediction total_loss",
+)
+MASK_STYLES = {
+    "temporal": ("#0072B2", "-"),
+    "spectral": ("#009E73", "--"),
+    "joint": ("#D55E00", "-."),
+}
 
 MASK_TYPES = ("temporal", "spectral", "joint")
 SUM_COLUMNS = (
@@ -461,6 +480,113 @@ def evaluate_conditions(
 
 
 
+def frequency_losses(sums: Any, alpha: float) -> dict:
+    """Derive cell-pooled losses from an (F, 6) sufficient-statistic array.
+
+    Content L1 divides content errors by content counts, not all counts.
+    Frequency total_loss applies L1 + alpha * content_L1 within each bin;
+    it is not an additive decomposition of the batch-averaged objective.
+    Undefined baseline ratios are warned about and represented as NaN.
+
+    Parameters
+    ----------
+    sums : array-like
+        Frequency accumulators (F, 6), ordered by SUM_COLUMNS.
+    alpha : float
+        Fitted nonnegative content-loss coefficient.
+
+    Returns
+    -------
+    dict
+        Model, constant and relative losses, each shaped (F, 3).
+    """
+    import numpy as np
+
+    values = np.asarray(sums, dtype=float)
+    if values.ndim != 2 or values.shape[1] != len(SUM_COLUMNS):
+        raise ValueError("Expected frequency statistics with shape (F, 6).")
+    if not len(values) or not np.isfinite(values).all():
+        raise ValueError("Frequency statistics must be nonempty and finite.")
+    if not np.isfinite(alpha) or alpha < 0 or (values < 0).any():
+        raise ValueError("Loss coefficient and statistics must be nonnegative.")
+    if (values[:, [0, 3]] <= 0).any():
+        raise ValueError("Every frequency needs selected and content cells.")
+    if (values[:, 3] > values[:, 0]).any():
+        raise ValueError("Content count cannot exceed selected-cell count.")
+    losses = {}
+    for name, columns in (("model", (1, 4)), ("constant", (2, 5))):
+        l1 = values[:, columns[0]] / values[:, 0]
+        content = values[:, columns[1]] / values[:, 3]
+        losses[name] = np.column_stack((l1, content, l1 + alpha * content))
+    baseline = losses["constant"]
+    if (baseline <= 0).any():
+        warnings.warn("Constant prediction loss is zero; ratio is undefined.")
+    losses["relative"] = np.divide(
+        losses["model"], baseline,
+        out=np.full_like(baseline, np.nan), where=baseline > 0,
+    )
+    return losses
+
+
+def fixed_loss_tables(
+    outputs: dict, frequency_axis: Sequence[float], frame_hop_ms: float,
+    alpha: float,
+) -> tuple:
+    """Return objective and frequency tables from matching condition JSONs.
+
+    Rows identify the condition and physical frequency, counts, three losses,
+    their matched constant-predictor losses, and ratios. Overall rows retain
+    the saved batch reduction; joint frequency rows score the intersection.
+    """
+    import numpy as np
+    import pandas as pd
+
+    if not outputs:
+        raise ValueError("Fixed-mask reporting requires saved conditions.")
+    axis = np.asarray(frequency_axis, dtype=float)
+    if axis.ndim != 1 or not len(axis) or not np.isfinite(axis).all():
+        raise ValueError("Expected nonempty finite frequency centres (F,).")
+    identity = next(iter(outputs.values()))["identity"]
+    rows, frequency_rows = [], []
+    for name, result in outputs.items():
+        if result["identity"] != identity:
+            raise ValueError("Fixed-mask conditions have different identities.")
+        values = np.asarray(result["objective_means"], dtype=float)
+        if values.shape != (6,) or not np.isfinite(values).all():
+            raise ValueError("Expected six finite saved objective means.")
+        if not np.allclose(
+            values[[2, 5]], values[[0, 3]] + alpha * values[[1, 4]],
+        ):
+            raise ValueError("Saved objectives disagree with criterion alpha.")
+        row = {
+            "condition": name, "mask": result["mask"],
+            "duration_frames": result["duration_frames"],
+            "duration_ms": result["duration_frames"] * frame_hop_ms,
+        }
+        for index, metric in enumerate(LOSS_METRICS):
+            row[metric] = values[index]
+            row[f"constant_prediction_{metric}"] = values[index + 3]
+            row[f"relative_{metric}"] = checked_ratio(
+                values[index], values[index + 3],
+            )
+        rows.append(row)
+        sums = np.asarray(result["frequency_sums"], dtype=float)
+        if sums.shape != (len(axis), len(SUM_COLUMNS)):
+            raise ValueError("Frequency centres and statistic rows differ.")
+        losses = frequency_losses(sums, alpha)
+        for i, hz in enumerate(axis):
+            row = {
+                "condition": name, "frequency_hz": hz,
+                **dict(zip(SUM_COLUMNS, sums[i])),
+            }
+            for j, metric in enumerate(LOSS_METRICS):
+                row[metric] = losses["model"][i, j]
+                row[f"constant_prediction_{metric}"] = losses["constant"][i, j]
+                row[f"relative_{metric}"] = losses["relative"][i, j]
+            frequency_rows.append(row)
+    return pd.DataFrame(rows), pd.DataFrame(frequency_rows)
+
+
 def plot_fixed(
     outputs: dict, frequency_axis: Sequence[float], frame_hop_ms: float,
     reports: Path, fit: Path, step: int, settings: Mapping,
@@ -655,7 +781,8 @@ def linear_temporal_errors(
     Returns
     -------
     tuple
-        Absolute-error sums of shape (F,), and edge-gap window count. Where
+        Absolute-error sums of shape (F, 2) for all/content cells, and the
+        edge-gap window count. Where
         a gap touches a window edge, use the single available endpoint.
     """
     if target.ndim != 3 or mask.shape != target.shape:
@@ -692,7 +819,11 @@ def linear_temporal_errors(
     estimate = left[:, None, :] + fraction[:, :, None] * (
         right - left
     )[:, None, :]
-    error = ((estimate - target).abs().double() * mask).sum((0, 1))
+    residual = (estimate - target).abs().double() * mask
+    error = torch.stack((
+        residual.sum((0, 1)),
+        (residual * (target.abs() > CONTENT_THRESHOLD)).sum((0, 1)),
+    ), dim=1)
     if not torch.isfinite(error).all():
         raise ValueError("Interpolation errors must be finite.")
     return error, int((~(has_left & has_right)).sum())
@@ -702,7 +833,7 @@ def linear_temporal_errors(
 def evaluate_interpolation(
     task: Any, options: Mapping, root: Path, identity: dict,
     workers: int, progress: Callable, batch_size: int,
-    smoke_batches: int | None = None,
+    smoke_batches: int | None = None, *, alpha: float,
 ) -> dict:
     """Evaluate interpolation on the original paired temporal masks.
 
@@ -710,6 +841,31 @@ def evaluate_interpolation(
     a single pass computes interpolation error sums for all durations.
     The resulting JSON records sums, edge counts and provenance without
     persisting targets. Partial aggregate sums allow interrupted replay.
+
+    Parameters
+    ----------
+    task : object
+        Prepared task with the pinned test dataset.
+    options : mapping
+        Explicit fixed durations, test batch budget, and mask seed.
+    root : pathlib.Path
+        Directory containing immutable condition summaries.
+    identity : dict
+        Checkpoint and test-selection provenance.
+    workers, batch_size : int
+        Loader concurrency and original evaluation batch size.
+    progress : callable
+        Lifecycle callback receiving completed/total batches and stage.
+    smoke_batches : int or None, optional
+        Stop without publishing after this many batches; default None.
+    alpha : float
+        Required fitted coefficient for content L1.
+
+    Returns
+    -------
+    dict
+        Per-duration frequency errors (F,) for all/content cells and three
+        batch-averaged objectives, with the matching evaluation identity.
     """
     import json
     import math
@@ -731,24 +887,30 @@ def evaluate_interpolation(
         raise ValueError("Test batch count differs from saved diagnostic.")
     frequency_count = len(conditions[str(durations[0])]["frequency_sums"])
     bins = balanced_bins(len(dataset), frequency_count, options["seed"])
-    result_path = root / "interpolation.json"
-    partial_path = root / "interpolation_partial.json"
+    result_path = root / "interpolation_metrics.json"
+    partial_path = root / "interpolation_metrics_partial.json"
     if result_path.exists() and smoke_batches is None:
         result = json.loads(result_path.read_text())
-        if result["identity"] != identity:
+        if (result["identity"] != identity
+                or result["criterion_alpha"] != alpha):
             raise ValueError("Saved interpolation provenance differs.")
         return result
-    sums = {str(d): torch.zeros(frequency_count, dtype=torch.float64)
+    sums = {str(d): torch.zeros(frequency_count, 2, dtype=torch.float64)
             for d in durations}
+    objectives = {str(d): torch.zeros(3, dtype=torch.float64)
+                  for d in durations}
     edges = {str(d): 0 for d in durations}
     offset, completed = 0, 0
     if partial_path.exists() and smoke_batches is None:
         state = json.loads(partial_path.read_text())
-        if state["identity"] != identity:
+        if (state["identity"] != identity
+                or state["criterion_alpha"] != alpha):
             raise ValueError("Partial interpolation provenance differs.")
         offset, completed = state["windows"], state["batches"]
         sums = {k: torch.tensor(v, dtype=torch.float64)
                 for k, v in state["error_sums"].items()}
+        objectives = {k: torch.tensor(v, dtype=torch.float64)
+                      for k, v in state["objective_sums"].items()}
         edges = state["edge_windows"]
     subset = torch.utils.data.Subset(dataset, range(offset, len(dataset)))
     loader = task.get_batch_iterator(
@@ -763,6 +925,16 @@ def evaluate_interpolation(
                 bins, options["seed"],
             )
             error, edge_count = linear_temporal_errors(target, padding, mask)
+            content_count = (mask & (
+                target.abs() > CONTENT_THRESHOLD
+            )).sum()
+            if content_count <= 0:
+                raise ValueError("Interpolation batch has no content cells.")
+            l1 = error[:, 0].sum() / mask.sum()
+            content_l1 = error[:, 1].sum() / content_count
+            objectives[str(duration)] += torch.stack((
+                l1, content_l1, l1 + alpha * content_l1,
+            ))
             sums[str(duration)] += error
             edges[str(duration)] += edge_count
         offset += len(target)
@@ -773,7 +945,9 @@ def evaluate_interpolation(
                 "identity": identity, "windows": offset,
                 "batches": completed,
                 "error_sums": {k: v.tolist() for k, v in sums.items()},
-                "edge_windows": edges,
+                "objective_sums": {k: v.tolist()
+                                   for k, v in objectives.items()},
+                "criterion_alpha": alpha, "edge_windows": edges,
             })
         if smoke_batches and completed >= smoke_batches:
             break
@@ -782,8 +956,11 @@ def evaluate_interpolation(
     result = {
         "identity": identity, "windows": offset, "batches": completed,
         "method": "linear between adjacent visible frames; edge hold",
-        "error_sums": {k: v.tolist() for k, v in sums.items()},
-        "edge_windows": edges,
+        "error_sums": {k: v[:, 0].tolist() for k, v in sums.items()},
+        "content_error_sums": {k: v[:, 1].tolist() for k, v in sums.items()},
+        "objective_means": {k: (v / completed).tolist()
+                            for k, v in objectives.items()},
+        "criterion_alpha": alpha, "edge_windows": edges,
     }
     if smoke_batches is None:
         for duration in durations:
@@ -796,6 +973,20 @@ def evaluate_interpolation(
             counts = [row[0] for row in expected["frequency_sums"]]
             if any(count != offset * duration for count in counts):
                 raise ValueError("Temporal condition mask counts differ.")
+        old_path = root / "interpolation.json"
+        if old_path.exists():
+            previous = json.loads(old_path.read_text())
+            if previous["identity"] != identity:
+                raise ValueError("Previous interpolation provenance differs.")
+            for duration in durations:
+                if not torch.allclose(
+                    torch.tensor(previous["error_sums"][str(duration)],
+                                 dtype=torch.float64),
+                    torch.tensor(result["error_sums"][str(duration)],
+                                 dtype=torch.float64),
+                    rtol=1e-10, atol=1e-8,
+                ):
+                    raise ValueError("Replayed interpolation L1 changed.")
         write_json(result_path, result)
         partial_path.unlink(missing_ok=True)
     return result
@@ -1002,3 +1193,176 @@ def plot_absolute_fixed(
         f"validation-selected checkpoint {step}",
     )
     print(f"Fixed-mask L1 figures saved: {reports.resolve()}", flush=True)
+
+
+def training_content_counts(
+    task: Any, task_cfg: Any, options: Mapping, root: Path, identity: dict,
+    workers: int, batch_size: int, progress: Callable,
+    smoke_batches: int | None = None,
+) -> dict:
+    """Count selected content cells in a reproducible training-window sample.
+
+    Targets have shape (B, T, F). Sampling is uniform without replacement
+    within the saved training selection, preserving its subgroup mixture in
+    expectation. Original training masks are replayed with a per-window seed,
+    independent of loader concurrency. Counts describe this diagnostic draw,
+    not the exact historical random masks. No predictions are computed.
+
+    Parameters
+    ----------
+    task, task_cfg : object
+        Prepared task and original training masking configuration.
+    options : mapping
+        Explicit sample_windows, selection_seed and mask_seed.
+    root : pathlib.Path
+        Campaign diagnostic directory, outside immutable fit storage.
+    identity : dict
+        Saved training selection and scientific fit identity.
+    workers, batch_size : int
+        Bounded loader concurrency and batch size.
+    progress : callable
+        Lifecycle callback receiving completed/total batches and stage.
+    smoke_batches : int or None, optional
+        Stop after this many batches without saving; default None.
+
+    Returns
+    -------
+    dict
+        Sample provenance and selected/content counts of shape (F,).
+    """
+    import json
+    import math
+    import random
+    import numpy as np
+    from .storage import digest, write_json
+    from util.mask_utils import mask_inputs, test_masked_dataset
+
+    if set(options) != {"sample_windows", "selection_seed", "mask_seed"}:
+        raise ValueError("Training content options require sample_windows, "
+                         "selection_seed and mask_seed.")
+    if any(type(v) is not int or v < 0 for v in options.values()):
+        raise ValueError("Training content options must be nonnegative ints.")
+    size = options["sample_windows"]
+    if not 0 < size <= len(task.train_set):
+        raise ValueError("Training sample must fit within saved selection.")
+    indices = np.random.default_rng(options["selection_seed"]).choice(
+        len(task.train_set), size=size, replace=False,
+    )
+    indices.sort()
+    provenance = {
+        **identity, "configuration": dict(options),
+        "sample_indices_sha256": digest(indices.tolist()),
+        "content_threshold": CONTENT_THRESHOLD,
+    }
+    destination = root / "training_content.json"
+    if destination.exists() and smoke_batches is None:
+        saved = json.loads(destination.read_text())
+        if saved["identity"] != provenance:
+            raise ValueError("Saved training content sample differs.")
+        return saved
+    dataset = torch.utils.data.Subset(
+        test_masked_dataset(task.train_set, targets_only=True), indices,
+    )
+    loader = task.get_batch_iterator(
+        dataset, batch_size, shuffle=False, num_workers=workers,
+    )
+    count = content_count = None
+    offset = 0
+    total = math.ceil(size / batch_size)
+    random_state = random.getstate()
+    try:
+        for batch_index, batch in enumerate(loader):
+            target = batch["target"]
+            valid = ~batch["attn_mask"].bool()
+            if not torch.isfinite(target).all():
+                raise ValueError("Training content targets must be finite.")
+            if count is None:
+                count = torch.zeros(target.shape[2], dtype=torch.int64)
+                content_count = torch.zeros_like(count)
+            for row in range(len(target)):
+                random.seed(options["mask_seed"] + int(indices[offset]))
+                values = target[row, valid[row]]
+                _, selected = mask_inputs(values, task_cfg)
+                selected = selected.bool()
+                count += selected.sum(0)
+                content_count += (
+                    selected & (values.abs() > CONTENT_THRESHOLD)
+                ).sum(0)
+                offset += 1
+            progress(batch_index + 1, total, "training_content_sample")
+            if smoke_batches and batch_index + 1 >= smoke_batches:
+                break
+    finally:
+        random.setstate(random_state)
+    if count is None or (count <= 0).any() or content_count.sum() == 0:
+        raise ValueError("Training sample lacks selected/content cells.")
+    result = {
+        "identity": provenance, "windows": offset,
+        "training_windows": len(task.train_set),
+        "selected_count": count.tolist(),
+        "content_count": content_count.tolist(),
+        "source": "sampled training targets with original training masks",
+        "historical_masks": False,
+    }
+    if smoke_batches is None:
+        write_json(destination, result)
+    return result
+
+
+def plot_training_content(
+    result: dict, axis: Sequence[float], reports: Path, fit: Path,
+    step: int, settings: Mapping,
+) -> None:
+    """Plot selected training content counts and fractions by frequency.
+
+    The table contains raw selected/content counts, content prevalence among
+    selected cells and each bin's share of selected content cells. No loss
+    contributions are inferred from these counts.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    from .reporting import Report
+
+    count = np.asarray(result["selected_count"], dtype=float)
+    content = np.asarray(result["content_count"], dtype=float)
+    if count.shape != (len(axis),) or content.shape != count.shape:
+        raise ValueError("Frequency centres and training counts differ.")
+    if (count <= 0).any() or not np.isfinite(count + content).all():
+        raise ValueError("Training counts must be finite with positive totals.")
+    if (content < 0).any() or (content > count).any() or content.sum() <= 0:
+        raise ValueError("Training content counts must lie within totals.")
+    frame = pd.DataFrame({
+        "frequency_hz": axis, "selected_count": count.astype(int),
+        "content_count": content.astype(int),
+        "content_fraction": content / count,
+        "share_of_content_cells": content / content.sum(),
+        "sample_windows": result["windows"],
+        "historical_masks": False,
+    })
+    report = Report(reports, fit, step, [], settings)
+    index = reports / "output_index.csv"
+    if index.exists():
+        report.entries = pd.read_csv(index).to_dict("records")
+    report.table("training/content_distribution/counts", frame,
+                 "Training subset counts under a reproducible original-mask "
+                 "draw; not historical masks or reconstruction errors")
+    if len(axis) < 2 or (np.diff(axis) <= 0).any():
+        raise ValueError("Histogram needs increasing frequency centres.")
+    width = float(np.min(np.diff(axis))) * 0.85
+    fig, axes = plt.subplots(1, 2, figsize=(20, 7))
+    for ax, values, ylabel in zip(
+        axes, (content, 100 * content / count),
+        ("Selected content cells", "Content / selected cells (%)"),
+    ):
+        ax.bar(axis, values, width=width, color="#0072B2")
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel(ylabel)
+        ax.set_xlim(min(axis) - width, max(axis) + width)
+        ax.ticklabel_format(axis="y", style="plain")
+    report.figure(
+        "training/content_distribution/counts", fig,
+        f"Training content cells: {result['windows']:,}-window estimate; "
+        f"|target| > {CONTENT_THRESHOLD:g}",
+    )
+    print(f"Training content reports saved: {reports.resolve()}", flush=True)
