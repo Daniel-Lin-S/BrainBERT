@@ -26,6 +26,12 @@ def prepare_example(
     data = (
         extracter(wav, statistics=statistics) if features is None else features
     )
+    if task_cfg.get("diagnostic_targets_only", False):
+        return {
+            "masked_input": data, "length": data.shape[0],
+            "mask_label": torch.zeros_like(data, dtype=torch.bool),
+            "wav": wav, "target": data,
+        }
     masked_data, mask_label, provenance = mask_inputs(
         data, task_cfg, return_provenance=True
     )

@@ -46,3 +46,28 @@ def test_short_windows_rejected():
             torch.zeros(1, 3, dtype=torch.bool), 1,
             torch.tensor([0]), 4, 14, torch.tensor([0]), 0,
         )
+
+
+def test_target_only_copy_preserves_original_recipe(monkeypatch):
+    """Diagnostic copies skip masks without changing shared configuration."""
+    from types import SimpleNamespace
+    from omegaconf import OmegaConf
+    from util.mask_utils import test_masked_dataset as clone
+    from datasets.masked_tf_dataset import prepare_example
+
+    original = SimpleNamespace(task_cfg=OmegaConf.create({}))
+    diagnostic = clone(original, targets_only=True)
+    assert "diagnostic_targets_only" not in original.task_cfg
+    features = torch.tensor([[2., 3.], [4., 5.]])
+
+    def unexpected_mask(*args, **kwargs):
+        raise AssertionError("Unused random masks must not be generated")
+
+    monkeypatch.setattr(
+        "datasets.masked_tf_dataset.mask_inputs", unexpected_mask,
+    )
+    result = prepare_example(
+        None, None, diagnostic.task_cfg, features=features,
+    )
+    assert torch.equal(result["target"], features)
+    assert not result["mask_label"].any()

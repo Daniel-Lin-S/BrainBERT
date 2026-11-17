@@ -200,7 +200,10 @@ def evaluate_fixed(
     import json
     import math
     from .storage import write_json
+    from util.mask_utils import test_masked_dataset
 
+    training_targets = test_masked_dataset(task.train_set, targets_only=True)
+    test_targets = test_masked_dataset(task.test_set, targets_only=True)
     durations = list(options["durations_frames"])
     if not durations or any(type(d) is not int or d <= 0 for d in durations):
         raise ValueError("Expected positive integer durations_frames.")
@@ -225,7 +228,7 @@ def evaluate_fixed(
         mean = torch.tensor(baseline["mean"], dtype=torch.float64)
     else:
         loader = task.get_batch_iterator(
-            task.train_set, size, shuffle=False, num_workers=workers
+            training_targets, size, shuffle=False, num_workers=workers
         )
         sums, count = None, 0
         for batch_index, batch in enumerate(loader):
@@ -267,7 +270,7 @@ def evaluate_fixed(
             progress(saved["batches"], saved["batches"], name)
             continue
         loader = task.get_batch_iterator(
-            task.test_set, size, shuffle=False, num_workers=workers
+            test_targets, size, shuffle=False, num_workers=workers
         )
         objectives = torch.zeros(6, dtype=torch.float64)
         frequency = torch.zeros(frequencies, 6, dtype=torch.float64)

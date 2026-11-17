@@ -45,7 +45,9 @@ def replacement_thresholds(policy: object = None) -> tuple[float, float]:
     return values[2], values[2] + values[1]
 
 
-def test_masked_dataset(dataset: object, policy: object = None) -> object:
+def test_masked_dataset(
+    dataset: object, policy: object = None, targets_only: bool = False,
+) -> object:
     """Clone dataset configuration for test-only masking without mutating training.
 
     Parameters
@@ -53,23 +55,30 @@ def test_masked_dataset(dataset: object, policy: object = None) -> object:
     dataset : Dataset
         Masked dataset, optionally nested in Subsets; sample indices stay fixed.
     policy : mapping or None, optional
-        Explicit replacement probabilities; None leaves the dataset unchanged.
+        Explicit replacement probabilities; default None.
+    targets_only : bool, optional
+        Skip unused stochastic masks in diagnostic copies, default False.
     """
-    if policy is None:
+    if policy is None and not targets_only:
         return dataset
-    replacement_thresholds(policy)
+    if policy is not None:
+        replacement_thresholds(policy)
     if isinstance(dataset, Subset):
         return Subset(
-            test_masked_dataset(dataset.dataset, policy), dataset.indices
+            test_masked_dataset(dataset.dataset, policy, targets_only),
+            dataset.indices
         )
     if not hasattr(dataset, "task_cfg"):
         raise ValueError("Test masking requires a dataset with task_cfg.")
     cloned = copy.copy(dataset)
     cloned.task_cfg = copy.deepcopy(dataset.task_cfg)
     with open_dict(cloned.task_cfg):
-        cloned.task_cfg.replacement_probabilities = OmegaConf.create(
-            dict(policy)
-        )
+        if policy is not None:
+            cloned.task_cfg.replacement_probabilities = OmegaConf.create(
+                dict(policy)
+            )
+        if targets_only:
+            cloned.task_cfg.diagnostic_targets_only = True
     return cloned
 
 
