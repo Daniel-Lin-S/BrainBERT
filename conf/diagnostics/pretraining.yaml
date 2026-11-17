@@ -1,0 +1,3 @@
+test_diagnostics:
+- representation_rank
+- frequency_errors

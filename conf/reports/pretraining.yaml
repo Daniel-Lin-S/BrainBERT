@@ -1,0 +1,26 @@
+formats:
+- png
+- csv
+splits:
+- train
+- validation
+- test
+figures:
+- learning_curves
+- mask_margins
+- mask_full_grid
+- frequency_errors
+- frequency_coverage
+- representation_rank
+- optimization
+- test_overview
+tables:
+- overall_metrics
+- objective_components
+- mask_margins
+- mask_full_grid
+- frequency_errors
+- frequency_coverage
+- representation_rank
+- optimization
+- provenance

@@ -12,6 +12,7 @@ import math
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import torch
@@ -20,8 +21,34 @@ from torch.utils.data import Subset
 
 from .lifecycle import OPERATIONAL_RUNNER, FitRun, scientific_config
 from .storage import file_digest, write_json
+from .report_settings import reports_requested
 
 log = logging.getLogger(__name__)
+
+
+def start_report(cfg: object, in_progress: bool = False) -> subprocess.Popen:
+    """Publish campaign outputs in a CPU-limited subprocess.
+
+    Parameters
+    ----------
+    cfg : object
+        Managed storage and campaign configuration.
+    in_progress : bool, optional
+        Permit rendering before fit completion, default False.
+    """
+    command = [
+        sys.executable, "-m", "util.experiments.reporting",
+        "--artifact-root", str(Path(cfg.storage.artifacts).resolve()),
+        "--campaign", cfg.campaign,
+        "--settings-json", json.dumps(OmegaConf.to_container(
+            cfg.exp.runner.reports, resolve=True,
+        )),
+    ]
+    if in_progress:
+        command.append("--in-progress")
+    return subprocess.Popen(command, env={
+        **os.environ, "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+    })
 
 
 def source_inventory(dataset: object) -> list:
@@ -179,7 +206,14 @@ def execute(cfg: object) -> dict:
     """
     import tasks
     from runner import Runner
+    from .monitoring import diagnostic_names
 
+    reports_requested(cfg.exp.runner.get("reports"))
+    selected_diagnostics = diagnostic_names(
+        cfg.exp.runner.get("test_diagnostics")
+    )
+    if selected_diagnostics and cfg.task.name != "spec_pretrain":
+        raise ValueError("STFT diagnostics require the spec_pretrain task.")
     OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     for field in ("campaign", "protocol", "data.pinned_test"):
         if OmegaConf.select(cfg, field) is None:
@@ -308,6 +342,11 @@ def execute(cfg: object) -> dict:
                 total_epochs=cfg.exp.runner.get("epochs"),
             )
             best = runner.train()
+            report_process = None
+            if reports_requested(cfg.exp.runner.get("reports")):
+                if runner.monitor is not None:
+                    runner.monitor.flush()
+                report_process = start_report(cfg, in_progress=True)
             metrics = runner.test(best)
             if str(cfg.exp.runner.device).startswith("cuda"):
                 metrics["peak_cuda_allocated_bytes"] = (
@@ -316,6 +355,16 @@ def execute(cfg: object) -> dict:
             if runner.monitor is not None:
                 runner.monitor.close()
             run.complete(metrics)
+            if report_process is not None:
+                if report_process.wait() != 0:
+                    warnings.warn(
+                        "Initial report failed; final rendering will retry."
+                    )
+                if start_report(cfg).wait() != 0:
+                    warnings.warn(
+                        "Fit completed, but report generation failed. "
+                        "Retry the standalone reporting command."
+                    )
             return metrics
         finally:
             if runner is not None:

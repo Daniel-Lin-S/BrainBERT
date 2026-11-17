@@ -1,0 +1,909 @@
+"""Render immutable fit monitors into campaign PNG figures and CSV tables.
+
+Invoke with --artifact-root and --campaign. Input fit references resolve to
+scientific.json and root/resume-segment monitor tables. Outputs are grouped
+by split and diagnostic under campaigns/<campaign>/reports/{figures,tables}.
+output_index.csv records each product's fit, checkpoint, state and meaning.
+No model fitting, feature extraction, or TensorBoard writes occur here.
+"""
+
+import argparse
+import io
+import json
+import math
+import textwrap
+import warnings
+import zlib
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+from .storage import atomic_write, file_digest
+from .report_settings import report_settings, reports_requested
+from .monitoring import ACTIONS, STRATEGIES, SUM_FIELDS
+
+DPI = 300
+COLORS = {
+    "train": "#0173b2",
+    "validation": "#de8f05",
+    "test": "#029e73",
+    "temporal_only": "#0173b2",
+    "spectral_only": "#de8f05",
+    "overlap": "#029e73",
+    "zero": "#cc78bc",
+    "random": "#d55e00",
+    "unchanged": "#56b4e9",
+    "all": "#333333",
+}
+HIDDEN_SUMS = set(SUM_FIELDS) - {"count", "content_count"}
+METRICS = ("l1", "content_l1", "relative_l1", "relative_content_l1")
+LABELS = {
+    "total_loss": "Total loss",
+    "l1": "L1",
+    "content_l1": "Content L1",
+    "relative_l1": "Relative L1",
+    "relative_content_l1": "Relative content L1",
+    "std_ratio": "SD ratio",
+    "effective_rank": "Effective rank",
+    "effective_rank_fraction": "Rank fraction",
+    "pca95_components": "PCA95 components",
+}
+TABLES = (
+    "epoch_metrics",
+    "metrics",
+    "mask_groups",
+    "frequency_coverage",
+    "validation_rank",
+    "validation_frequency",
+    "test_rank",
+    "test_frequency",
+)
+PHASES = ("train", "validation", "test")
+FOLDERS = {"train": "training", "validation": "validation", "test": "test"}
+DISPLAY = {
+    "temporal_only": "Temporal only",
+    "spectral_only": "Spectral only",
+    "overlap": "Overlap",
+    "zero": "Zero",
+    "random": "Random",
+    "unchanged": "Unchanged",
+    "all": "Overall",
+}
+
+
+def read_table(path: Path) -> pd.DataFrame:
+    """Read CSV, recovering only complete flushed gzip records.
+
+    Parameters
+    ----------
+    path : Path
+        CSV or gzipped CSV. Missing gzip trailers produce a warning.
+    """
+    if path.suffix == ".gz":
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        data = decoder.decompress(path.read_bytes()).decode("utf-8")
+        if not decoder.eof:
+            warnings.warn(f"Missing gzip footer; auditing rows: {path}")
+            if not data.endswith("\n"):
+                raise ValueError(f"Incomplete CSV record: {path}")
+    else:
+        data = path.read_text()
+    frame = pd.read_csv(io.StringIO(data))
+    if frame.empty:
+        raise ValueError(f"Empty monitor table: {path}")
+    if np.isinf(frame.select_dtypes("number").to_numpy()).any():
+        raise ValueError(f"Infinite monitor value: {path}")
+    return frame
+
+
+def load_history(fit: Path) -> dict[str, pd.DataFrame]:
+    """Merge invocation tables, dropping overwritten unsaved trajectories."""
+    root = fit / "monitoring"
+    roots = [root] + sorted((root / "segments").glob("*"))
+    history = {}
+    for segment in roots:
+        metrics_path = segment / "metrics.csv"
+        if not metrics_path.exists():
+            continue
+        metrics = read_table(metrics_path)
+        training = metrics[metrics.phase == "train"]
+        cutoff = int(training.interval_start.min()) if len(training) else None
+        for name in TABLES:
+            candidates = [segment / f"{name}.csv", segment / f"{name}.csv.gz"]
+            path = next((p for p in candidates if p.exists()), None)
+            if path is None:
+                continue
+            frame = metrics if name == "metrics" else read_table(path)
+            previous = history.get(name)
+            if previous is not None and cutoff is not None:
+                previous = previous[previous.step < cutoff]
+            history[name] = pd.concat(
+                [previous, frame] if previous is not None else [frame],
+                ignore_index=True,
+            )
+    if "metrics" not in history:
+        raise ValueError(f"No monitor history in {fit}")
+    overall = history["metrics"]
+    if overall.duplicated(["phase", "step"]).any():
+        raise ValueError("Conflicting duplicate phase/step monitor rows.")
+    overall["total_loss"] = overall.original_loss
+    overall["std_ratio"] = overall.prediction_std / overall.target_std
+    for phase in ("validation", "test"):
+        name = f"{phase}_frequency"
+        if name not in history:
+            continue
+        for step, block in history[name].groupby("step"):
+            expected = block.frequency_hz.nunique() * 4
+            if (
+                len(block) != expected
+                or block.duplicated(["strategy", "frequency_hz"]).any()
+            ):
+                raise ValueError(f"Incomplete {phase} frequency block: {step}")
+            match = overall[
+                (overall.phase == phase)
+                & ((overall.step == step) | (overall.checkpoint_step == step))
+            ]
+            if len(match) != 1 or int(
+                block.loc[block.strategy == "all", "selected_cells"].sum()
+            ) != int(match.iloc[0]["count"]):
+                raise ValueError(f"Frequency counts disagree at {phase} {step}")
+    return history
+
+
+def verify_fit(fit: Path) -> None:
+    """Check all immutable completion artifacts without loading a model."""
+    record = json.loads((fit / "complete.json").read_text())
+    if record["fit_id"] != fit.name:
+        raise ValueError("Completion record identifies another fit.")
+    for name, expected in record["artifacts"].items():
+        path = (fit / name).resolve()
+        if not path.is_relative_to(fit.resolve()):
+            raise ValueError("Completion artifact escapes its fit directory.")
+        if file_digest(path) != expected:
+            raise ValueError(f"Completion checksum mismatch: {path}")
+
+
+def figure_output(name: str) -> str:
+    """Group PNGs by split, with one shared mask-condition subfolder.
+
+    Parameters
+    ----------
+    name : str
+        Semantic figure name used by report selection.
+
+    Returns
+    -------
+    str
+        Report-relative PNG path; margins and grids have distinct prefixes.
+    """
+    parts = name.split("/")
+    if parts[0] == "optimization":
+        parts = ["training", "optimization", *parts[1:]]
+    if "mask_conditions" in parts:
+        folder = "/".join(parts[:2])
+        filename = "_".join(parts[2:])
+    else:
+        folder = parts[0]
+        filename = "_".join(parts[1:])
+    return f"figures/{folder}/{filename}.png"
+
+
+class Report:
+    """Publish independently usable outputs with one campaign index."""
+
+    def __init__(
+        self,
+        root: Path,
+        fit: Path,
+        best: int,
+        epochs: list,
+        settings: object = None,
+    ) -> None:
+        self.settings = report_settings(settings)
+        self.root = root.resolve()
+        self.fit = fit.name
+        self.best = best
+        self.epochs = epochs
+        self.entries = []
+        self.root.mkdir(parents=True, exist_ok=True)
+        sns.set_theme(style="whitegrid", context="talk", font_scale=0.85)
+
+    def wants(self, kind: str, name: str) -> bool:
+        """Select an output by its explicit format, family, and split."""
+        format_name = "png" if kind == "figures" else "csv"
+        phase = name.split("/")[0]
+        phase = {"training": "train", "optimization": "train"}.get(phase, phase)
+        if (
+            format_name not in self.settings["formats"]
+            or phase not in self.settings["splits"]
+        ):
+            return False
+        if "/margins/" in name:
+            family = "mask_margins"
+        elif "/full_grid/" in name:
+            family = "mask_full_grid"
+        elif "frequency_coverage/" in name:
+            family = "frequency_coverage"
+        elif "/frequency/" in name:
+            family = "frequency_errors"
+        elif "/representation/" in name:
+            family = "representation_rank"
+        elif name.startswith("optimization/"):
+            family = "optimization"
+        elif "/provenance/" in name:
+            family = "provenance"
+        elif "objective" in name:
+            family = "objective_components"
+        elif kind == "tables":
+            family = "overall_metrics"
+        elif name.startswith("test/"):
+            family = "test_overview"
+        else:
+            family = "learning_curves"
+        return family in self.settings[kind]
+
+    def register(self, name: str, meaning: str, state: str = "ready") -> None:
+        """Publish the index after each completed product."""
+        if state == "pending":
+            kind, relative = name.split("/", 1)
+            if not self.wants(kind, relative):
+                return
+        if name.startswith("figures/"):
+            name = figure_output(name[len("figures/") : -len(".png")])
+        self.entries = [e for e in self.entries if e["output"] != name]
+        self.entries.append(
+            {
+                "output": name,
+                "description": meaning,
+                "state": state,
+                "fit_id": self.fit,
+                "checkpoint_step": self.best,
+            }
+        )
+        frame = pd.DataFrame(self.entries)
+        atomic_write(
+            self.root / "output_index.csv",
+            lambda p: frame.to_csv(p, index=False),
+            lambda p: pd.read_csv(p),
+        )
+
+    def table(self, name: str, frame: pd.DataFrame, meaning: str) -> None:
+        """Save a nonempty derived table, preserving undefined values."""
+        if frame.empty or not self.wants("tables", name):
+            return
+        frame = frame.drop(columns=list(HIDDEN_SUMS), errors="ignore")
+        path = f"tables/{name}.csv"
+        atomic_write(
+            self.root / path,
+            lambda p: frame.to_csv(p, index=False),
+            lambda p: pd.read_csv(p),
+        )
+        self.register(path, meaning)
+
+    def figure(self, name: str, fig: object, meaning: str) -> None:
+        """Save and audit a PNG without exposing a partially written image."""
+        if not self.wants("figures", name):
+            plt.close(fig)
+            return
+        path = figure_output(name)
+        fig.suptitle(textwrap.fill(meaning, 82), fontsize=18)
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
+        try:
+            atomic_write(
+                self.root / path,
+                lambda p: fig.savefig(
+                    p, format="png", dpi=DPI, bbox_inches="tight"
+                ),
+                lambda p: plt.imread(p, format="png"),
+            )
+        finally:
+            plt.close(fig)
+        self.register(path, meaning)
+
+    def step_axis(self, ax: object) -> None:
+        """Annotate actual optimizer steps and epoch boundaries."""
+        ax.set_xlabel("Optimiser steps")
+        for epoch, step in enumerate(self.epochs, 1):
+            ax.axvline(step, color="0.8", lw=0.8, zorder=0)
+            ax.text(
+                step,
+                1.02,
+                f"E{epoch}",
+                fontsize=9,
+                transform=ax.get_xaxis_transform(),
+                ha="center",
+            )
+        ax.axvline(self.best, color="black", ls=":", lw=1.5)
+
+
+def line_panel(
+    ax: object,
+    frame: pd.DataFrame,
+    x: str,
+    y: str,
+    group: str,
+    reference: bool = False,
+) -> None:
+    """Draw unsmoothed series with consistent color and line encodings."""
+    if y not in frame:
+        return
+    groups = list(frame[group].drop_duplicates())
+    colors = sns.color_palette("colorblind", max(len(groups), 3))
+    styles = ("-", "--", "-.", ":")
+    for index, value in enumerate(groups):
+        rows = frame[frame[group] == value].sort_values(x)
+        ax.plot(
+            rows[x],
+            rows[y],
+            label=DISPLAY.get(value, str(value)),
+            color=COLORS.get(value, colors[index]),
+            ls=styles[index % len(styles)],
+            lw=2,
+            marker="o" if value == "validation" else None,
+            markersize=3,
+        )
+    if reference:
+        ax.axhline(1, color="gray", ls="--", lw=1)
+    ax.set_ylabel(LABELS.get(y, y.replace("_", " ")))
+    ax.legend(
+        frameon=False,
+        fontsize=10,
+        loc="lower left",
+        bbox_to_anchor=(0, 1.01),
+        ncol=min(len(groups), 3),
+    )
+
+
+def learning_figures(report: Report, history: dict) -> None:
+    """Render overall learning, rank, and optimization histories."""
+    metrics = history["metrics"]
+    learning = metrics[metrics.phase != "test"]
+    keys = ("total_loss", *METRICS, "std_ratio")
+    fig, axes = plt.subplots(3, 2, figsize=(15, 14))
+    for ax, key in zip(axes.flat, keys):
+        line_panel(
+            ax,
+            learning,
+            "step",
+            key,
+            "phase",
+            key.startswith("relative") or key == "std_ratio",
+        )
+        report.step_axis(ax)
+    report.figure(
+        "training/losses/learning_curves",
+        fig,
+        "Masked reconstruction learning; dotted line: selected "
+        "checkpoint; training is an online interval average",
+    )
+    train = learning[learning.phase == "train"]
+    fig, axes = plt.subplots(3, 1, figsize=(12, 12))
+    groups = (
+        [k for k in train if k.startswith("lr_group_")],
+        ["gradient_norm_mean", "gradient_norm_max"],
+        ["clipping_fraction"],
+    )
+    for ax, columns in zip(axes, groups):
+        long = train.melt(
+            id_vars="step",
+            value_vars=columns,
+            var_name="monitor",
+            value_name="value",
+        )
+        line_panel(ax, long, "step", "value", "monitor")
+        report.step_axis(ax)
+    axes[0].set_ylabel("Learning rate")
+    axes[1].set_ylabel("Gradient norm")
+    threshold = json.loads((report_fit(report) / "scientific.json").read_text())
+    axes[1].axhline(threshold["runner"]["grad_clip"], color="gray", ls="--")
+    axes[2].set_ylabel("Clipping fraction")
+    axes[2].set_ylim(0, 1)
+    report.figure("optimization/dynamics", fig, "Optimization dynamics")
+    if "validation_rank" in history:
+        rank = history["validation_rank"].assign(phase="validation")
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12))
+        for ax, key in zip(
+            axes,
+            ("effective_rank", "effective_rank_fraction", "pca95_components"),
+        ):
+            line_panel(ax, rank, "step", key, "phase")
+            report.step_axis(ax)
+        report.figure(
+            "validation/representation/rank",
+            fig,
+            "Diversity of pooled masked-window embeddings",
+        )
+
+
+def report_fit(report: Report) -> Path:
+    """Resolve the shared fit associated with the campaign report."""
+    return report.root.parents[2] / "fits" / report.fit
+
+
+def condition_figures(report: Report, history: dict) -> None:
+    """Keep six marginal totals separate from the nine masking conditions."""
+    for phase, rows in history["mask_groups"].groupby("phase", sort=False):
+        folder = FOLDERS[phase]
+        for family, chosen in (
+            (
+                "margins",
+                rows[(rows.strategy == "all") | (rows.action == "all")],
+            ),
+            (
+                "full_grid",
+                rows[(rows.strategy != "all") & (rows.action != "all")],
+            ),
+        ):
+            chosen = chosen.copy()
+            chosen["condition"] = chosen.strategy + " / " + chosen.action
+            report.table(
+                f"{folder}/mask_conditions/{family}/metrics",
+                chosen,
+                f"{phase} {family}: pooled cell-weighted statistics",
+            )
+            if not report.wants(
+                "figures", f"{folder}/mask_conditions/{family}/history"
+            ):
+                continue
+            if phase != "test":
+                if family == "margins":
+                    fig, axes = plt.subplots(2, 4, figsize=(24, 11))
+                    for row_index, (field, pooled) in enumerate(
+                        (("strategy", "action"), ("action", "strategy"))
+                    ):
+                        subset = chosen[chosen[pooled] == "all"]
+                        for ax, key in zip(axes[row_index], METRICS):
+                            line_panel(
+                                ax,
+                                subset,
+                                "step",
+                                key,
+                                field,
+                                key.startswith("relative"),
+                            )
+                            report.step_axis(ax)
+                    report.figure(
+                        f"{folder}/mask_conditions/{family}/history",
+                        fig,
+                        f"{phase.title()} six mask margins",
+                    )
+                else:
+                    for key in METRICS:
+                        fig, axes = plt.subplots(3, 3, figsize=(17, 13))
+                        for ax, ((strategy, action), group) in zip(
+                            axes.flat,
+                            chosen.groupby(["strategy", "action"], sort=False),
+                        ):
+                            ax.plot(group.step, group[key], lw=2)
+                            ax.set_title(
+                                f"{DISPLAY[strategy]} / {DISPLAY[action]}"
+                            )
+                            ax.set_ylabel(LABELS[key])
+                            if key.startswith("relative"):
+                                ax.axhline(1, color="gray", ls="--")
+                            report.step_axis(ax)
+                        report.figure(
+                            f"{folder}/mask_conditions/full_grid/{key}_history",
+                            fig,
+                            f"{phase.title()} nine conditions: {LABELS[key]}",
+                        )
+            if phase in ("validation", "test"):
+                snapshot = chosen[
+                    chosen.step
+                    == (
+                        report.best
+                        if phase == "validation"
+                        else chosen.step.max()
+                    )
+                ]
+                fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+                for ax, key in zip(axes.flat, METRICS):
+                    if family == "full_grid":
+                        grid = snapshot.pivot(
+                            index="strategy", columns="action", values=key
+                        ).reindex(index=STRATEGIES, columns=ACTIONS)
+                        grid = grid.rename(index=DISPLAY, columns=DISPLAY)
+                        sns.heatmap(
+                            grid,
+                            annot=True,
+                            fmt=".3f",
+                            cmap="viridis",
+                            ax=ax,
+                            cbar_kws={"label": LABELS[key]},
+                        )
+                        ax.set_xlabel("Replacement")
+                        ax.set_ylabel("Strategy")
+                    else:
+                        ax.scatter(snapshot[key], snapshot.condition, s=65)
+                        if key.startswith("relative"):
+                            ax.axvline(1, color="gray", ls="--")
+                        ax.set_xlabel(LABELS[key])
+                    ax.set_title(LABELS[key])
+                report.figure(
+                    f"{folder}/mask_conditions/{family}/selected_checkpoint",
+                    fig,
+                    f"{phase.title()} mask conditions at checkpoint "
+                    f"{report.best}",
+                )
+
+
+def frequency_figures(
+    report: Report,
+    history: dict,
+    phases: tuple = ("validation", "test"),
+    coverage_enabled: bool = True,
+) -> None:
+    """Plot actual-bin frequency errors and selection rates."""
+    for phase in phases:
+        name = f"{phase}_frequency"
+        if name not in history:
+            report.register(
+                f"figures/{phase}/frequency/reconstruction.png",
+                f"{phase} frequency diagnostics",
+                "pending",
+            )
+            continue
+        frame = history[name]
+        report.table(
+            f"{phase}/frequency/reconstruction",
+            frame,
+            "Per-bin errors use their own selected/content counts",
+        )
+        if not report.wants("figures", f"{phase}/frequency/reconstruction"):
+            continue
+        if phase == "validation":
+            fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+            for ax, key in zip(axes, ("relative_l1", "relative_content_l1")):
+                grid = frame[frame.strategy == "all"].pivot(
+                    index="frequency_hz",
+                    columns="step",
+                    values=key,
+                )
+                mesh = ax.pcolormesh(
+                    grid.columns,
+                    grid.index,
+                    grid.values,
+                    shading="nearest",
+                    cmap="viridis",
+                )
+                fig.colorbar(mesh, ax=ax, label=LABELS[key])
+                ax.set_ylabel("Frequency (Hz)")
+                report.step_axis(ax)
+            report.figure(
+                "validation/frequency/evolution",
+                fig,
+                "Validation relative reconstruction error; "
+                "checkpoint cells use actual step spacing",
+            )
+        snapshot = frame[frame.step == report.best]
+        fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+        for ax, key in zip(axes.flat, METRICS):
+            line_panel(
+                ax,
+                snapshot,
+                "frequency_hz",
+                key,
+                "strategy",
+                key.startswith("relative"),
+            )
+            if key == "l1":
+                baseline = snapshot[snapshot.strategy == "all"]
+                ax.plot(
+                    baseline.frequency_hz,
+                    baseline.zero_baseline_l1,
+                    color="gray",
+                    ls=":",
+                    label="Overall zero baseline",
+                )
+                ax.legend(
+                    frameon=False,
+                    fontsize=9,
+                    loc="lower left",
+                    bbox_to_anchor=(0, 1.01),
+                    ncol=3,
+                )
+            ax.set_xlabel("Frequency (Hz)")
+        report.figure(
+            f"{phase}/frequency/reconstruction",
+            fig,
+            f"{phase.title()} frequency reconstruction at "
+            f"checkpoint {report.best}",
+        )
+    if not coverage_enabled:
+        return
+    coverage = history["frequency_coverage"]
+    for phase in PHASES:
+        frame = coverage[coverage.phase == phase].copy()
+        if frame.empty:
+            continue
+        if phase == "train":
+            frame = frame[frame.scope == "interval"]
+            frame = frame.groupby(["frequency_hz", "strategy"], as_index=False)[
+                ["selected_cells", "valid_cells"]
+            ].sum()
+            frame["selection_rate"] = frame.selected_cells / frame.valid_cells
+        else:
+            frame = frame[frame.step == frame.step.max()]
+        folder = FOLDERS[phase]
+        report.table(
+            f"{folder}/frequency_coverage/coverage",
+            frame,
+            "Training exposure sums canonical intervals across resumes",
+        )
+        if not report.wants("figures", f"{folder}/frequency_coverage/coverage"):
+            continue
+        fig, ax = plt.subplots(figsize=(12, 6))
+        line_panel(ax, frame, "frequency_hz", "selection_rate", "strategy")
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("Selection rate")
+        ax.set_ylim(0, 1)
+        report.figure(
+            f"{folder}/frequency_coverage/coverage",
+            fig,
+            f"{phase.title()} frequency masking coverage",
+        )
+
+
+def export_tables(report: Report, history: dict) -> None:
+    """Publish numeric results before slower figure rendering."""
+    metrics = history["metrics"]
+    for phase in PHASES:
+        frame = metrics[metrics.phase == phase]
+        report.table(
+            f"{FOLDERS[phase]}/overall/metrics",
+            frame,
+            "Original objective is batch-mean; other errors are pooled",
+        )
+    optimization = metrics[metrics.phase == "train"]
+    columns = ["step", "interval_start", "interval_end", "batches"] + [
+        c
+        for c in optimization
+        if c.startswith(("lr_group_", "gradient_")) or c == "clipping_fraction"
+    ]
+    report.table(
+        "optimization/dynamics",
+        optimization[columns],
+        "Learning rates and pre-clipping gradient diagnostics",
+    )
+    notes = pd.DataFrame(
+        [
+            {
+                "topic": "aggregation",
+                "detail": (
+                    "total_loss is batch-mean; l1 "
+                    "and content_l1 are cell-pooled"
+                ),
+            },
+            {
+                "topic": "epochs",
+                "detail": (
+                    "Use canonical step intervals; resumed "
+                    "epoch summaries can be partial"
+                ),
+            },
+            {
+                "topic": "frequency_logs",
+                "detail": (
+                    "Missing gzip footers are warned; "
+                    "only complete audited blocks are used"
+                ),
+            },
+            {
+                "topic": "inference",
+                "detail": (
+                    "Descriptive single-fit results; "
+                    "no independent-session significance"
+                ),
+            },
+        ]
+    )
+    report.table(
+        "training/provenance/interpretation",
+        notes,
+        "Aggregation definitions and interpretation limits",
+    )
+    for phase in ("validation", "test"):
+        name = f"{phase}_rank"
+        if name in history:
+            report.table(
+                f"{phase}/representation/rank",
+                history[name],
+                "Centered covariance of pooled masked-window embeddings",
+            )
+        else:
+            report.register(
+                f"tables/{phase}/representation/rank.csv",
+                "Representation diagnostics",
+                "pending",
+            )
+    test = metrics[metrics.phase == "test"]
+    if test.empty:
+        report.register(
+            "tables/test/overall/objective.csv",
+            "Final test objective",
+            "pending",
+        )
+        return
+    row = test.iloc[-1]
+    alpha = json.loads((report_fit(report) / "scientific.json").read_text())[
+        "criterion"
+    ]["alpha"]
+    result = []
+    for label, l1, content in (
+        ("model", row.original_l1_loss, row.original_content_l1),
+        (
+            "zero_baseline",
+            row.original_zero_baseline_l1,
+            row.original_content_zero_baseline_l1,
+        ),
+    ):
+        result.append(
+            {
+                "predictor": label,
+                "total_loss": l1 + alpha * content,
+                "l1": l1,
+                "content_l1": content,
+                "weighted_content_l1": alpha * content,
+                "aggregation": "batch_mean",
+                "batches": row.batches,
+                "checkpoint_step": row.checkpoint_step,
+            }
+        )
+    report.table(
+        "test/overall/objective",
+        pd.DataFrame(result),
+        "Actual objective and matching zero-prediction objective",
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for ax, key in zip(axes, ("relative_l1", "relative_content_l1")):
+        ax.scatter([row[key]], ["Overall"], s=80)
+        ax.axvline(1, color="gray", ls="--")
+        ax.set_xlabel(LABELS[key])
+    report.figure(
+        "test/overall/relative_errors",
+        fig,
+        "Held-out reconstruction relative to zero prediction",
+    )
+    test_rank_figure(report, history)
+
+
+def test_rank_figure(report: Report, history: dict) -> None:
+    """Publish rank diagnostics independently of already-ready figures."""
+    if "test_rank" in history and report.wants(
+        "figures", "test/representation/rank"
+    ):
+        rank = history["test_rank"].iloc[-1]
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        for ax, key in zip(
+            axes,
+            ("effective_rank", "effective_rank_fraction", "pca95_components"),
+        ):
+            ax.scatter(["Test"], [rank[key]], s=80)
+            ax.set_ylabel(LABELS[key])
+        report.figure(
+            "test/representation/rank",
+            fig,
+            "Test pooled-embedding diversity at the selected checkpoint",
+        )
+
+
+def render(
+    artifact_root: Path,
+    campaign: str,
+    verify: bool = True,
+    diagnostics_only: bool = False,
+    settings: object = None,
+) -> Path:
+    """Publish available products without waiting for optional diagnostics."""
+    base = artifact_root.resolve() / "campaigns" / campaign
+    if settings is not None and not reports_requested(settings):
+        return base / "reports"
+    references = sorted((base / "fits").glob("*.json"))
+    if len(references) != 1:
+        raise ValueError(
+            "This report requires exactly one campaign fit reference."
+        )
+    fit_id = json.loads(references[0].read_text())["fit_id"]
+    fit = artifact_root.resolve() / "fits" / fit_id
+    if settings is None:
+        provenance = json.loads((fit / "provenance.json").read_text())
+        settings = provenance["invocation"]["exp"]["runner"].get("reports")
+    settings = report_settings(settings)
+    if not reports_requested(settings):
+        return base / "reports"
+    if verify:
+        verify_fit(fit)
+    history = load_history(fit)
+    root = base / "reports"
+    for name, relative in (
+        ("test_rank", "representation/rank.csv"),
+        ("test_frequency", "frequency/reconstruction.csv"),
+    ):
+        path = root / "tables/test" / relative
+        if path.exists():
+            history[name] = read_table(path)
+    validation = history["metrics"].query("phase == 'validation'")
+    best = int(validation.loc[validation.original_loss.idxmin(), "step"])
+    cfg = json.loads((fit / "scientific.json").read_text())
+    budget = cfg["task"].get("sampling", {}).get("sample_budget")
+    total = cfg["runner"]["total_steps"]
+    per_epoch = (
+        math.ceil(budget / cfg["runner"]["train_batch_size"])
+        if budget
+        else total
+    )
+    if "epoch_metrics" in history:
+        epoch_steps = sorted(history["epoch_metrics"].step.unique().tolist())
+    else:
+        epoch_steps = list(range(per_epoch, total + 1, per_epoch))
+    report = Report(
+        root,
+        fit,
+        best,
+        epoch_steps,
+        settings=settings,
+    )
+    if diagnostics_only:
+        index = root / "output_index.csv"
+        if index.exists():
+            report.entries = pd.read_csv(index).to_dict("records")
+        if "test_rank" in history and report.wants(
+            "tables", "test/representation/rank"
+        ):
+            report.register(
+                "tables/test/representation/rank.csv",
+                "Test rank uses the validation calculation",
+            )
+        test_rank_figure(report, history)
+        frequency_figures(
+            report, history, phases=("test",), coverage_enabled=False
+        )
+        return root
+    export_tables(report, history)
+    for function in (learning_figures, condition_figures, frequency_figures):
+        try:
+            function(report, history)
+        except Exception as error:
+            report.register(function.__name__, str(error), "failed")
+            warnings.warn(
+                f"Report section failed: {function.__name__}: {error}"
+            )
+    print(f"Saved campaign figures and tables: {root}", flush=True)
+    return root
+
+
+def main() -> None:
+    """Resolve campaign references and generate PNG/CSV outputs."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifact-root", type=Path, required=True)
+    parser.add_argument("--campaign", required=True)
+    parser.add_argument("--in-progress", action="store_true")
+    config = parser.add_mutually_exclusive_group()
+    config.add_argument("--report-config", type=Path)
+    config.add_argument("--settings-json")
+    args = parser.parse_args()
+    settings = None
+    if args.report_config:
+        from omegaconf import OmegaConf
+
+        loaded = OmegaConf.load(args.report_config)
+        settings = loaded
+        settings = report_settings(settings)
+    elif args.settings_json:
+        settings = json.loads(args.settings_json)
+    render(
+        args.artifact_root,
+        args.campaign,
+        verify=not args.in_progress,
+        settings=settings,
+    )
+
+
+if __name__ == "__main__":
+    main()

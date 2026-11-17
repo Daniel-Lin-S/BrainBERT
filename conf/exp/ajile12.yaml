@@ -1,6 +1,8 @@
-# AJILE pre-training inherits the original optimizer and batching settings.
+# AJILE pre-training reuses shared diagnostic and report profiles.
 defaults:
   - spec2vec
+  - /diagnostics@runner: pretraining
+  - /reports@runner.reports: pretraining
   - _self_
 runner:
   total_steps: null
