@@ -779,3 +779,27 @@ def test_epoch_patience_and_retained_snapshots(tmp_path):
     finally:
         runner.progress.close()
         runner.monitor.close()
+
+
+def test_portable_encoder_export(tmp_path):
+    """Selected weights load safely without training-only Python objects."""
+    from util.experiments.storage import export_model_checkpoint
+
+    source = tmp_path / "selected.pth"
+    destination = tmp_path / "encoder.pth"
+    weights = {"weight": torch.arange(6.).reshape(2, 3)}
+    torch.save({
+        "model": weights, "model_cfg": OmegaConf.create({"hidden_dim": 2}),
+        "completed_steps": 10, "optimizer": SimpleNamespace(training=True),
+    }, source)
+    export_model_checkpoint(source, destination)
+    result = torch.load(destination, weights_only=True)
+    torch.testing.assert_close(result["model"]["weight"], weights["weight"])
+    assert result["model_cfg"] == {"hidden_dim": 2}
+    assert "optimizer" not in result
+    modified = destination.stat().st_mtime_ns
+    export_model_checkpoint(source, destination)
+    assert destination.stat().st_mtime_ns == modified
+    torch.save({"changed": True}, source)
+    with pytest.raises(ValueError, match="different source"):
+        export_model_checkpoint(source, destination)

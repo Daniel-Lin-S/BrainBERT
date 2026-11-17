@@ -83,3 +83,52 @@ def write_json(path: Path, value: object) -> None:
             raise ValueError(f"JSON audit failed: {candidate.resolve()}")
 
     atomic_write(path, lambda p: p.write_text(text + "\n"), audit)
+
+
+def export_model_checkpoint(source: Path, destination: Path) -> None:
+    """Export selected CPU weights without optimiser-dependent pickle objects.
+
+    Parameters
+    ----------
+    source : pathlib.Path
+        Final validation-selected checkpoint from a completed fit.
+    destination : pathlib.Path
+        Shared derived encoder artifact, outside the immutable fit results.
+        Existing exports must match the source checksum and are reused.
+    """
+    import torch
+    from omegaconf import OmegaConf
+
+    source, destination = Path(source).resolve(), Path(destination).resolve()
+    checksum = file_digest(source)
+    if destination.exists():
+        existing = torch.load(
+            destination, map_location="cpu", weights_only=True
+        )
+        if existing.get("source_sha256") != checksum:
+            raise ValueError("Existing encoder export has a different source.")
+        return
+    state = torch.load(source, map_location="cpu", weights_only=False)
+    configuration = state["model_cfg"]
+    if OmegaConf.is_config(configuration):
+        configuration = OmegaConf.to_container(configuration, resolve=True)
+    weights = state["model"]
+    if not weights or any(
+        not torch.isfinite(t).all() for t in weights.values()
+    ):
+        raise ValueError("Encoder export requires nonempty finite weights.")
+    result = {"model": weights, "model_cfg": configuration,
+              "completed_steps": state["completed_steps"],
+              "source_sha256": checksum}
+
+    def audit(path: Path) -> None:
+        saved = torch.load(path, map_location="cpu", weights_only=True)
+        if saved["source_sha256"] != checksum:
+            raise ValueError("Encoder export source checksum differs.")
+        if set(saved["model"]) != set(weights) or any(
+            not torch.equal(saved["model"][key], value)
+            for key, value in weights.items()
+        ):
+            raise ValueError("Encoder export differs from selected weights.")
+
+    atomic_write(destination, lambda path: torch.save(result, path), audit)
