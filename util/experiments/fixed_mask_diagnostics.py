@@ -166,6 +166,7 @@ def evaluate_fixed(
     task: Any, model: torch.nn.Module, cfg: Any,
     options: Mapping, root: Path, identity: dict, device: str,
     workers: int, progress: Callable, smoke_batches: int | None = None,
+    publish: Callable | None = None,
 ) -> dict:
     """Replay fixed test conditions and persist small resumable summaries.
 
@@ -187,6 +188,9 @@ def evaluate_fixed(
         Receives completed and total batch counts and stage name.
     smoke_batches : int or None, optional
         Bounded audit without publishing, default None.
+
+    publish : callable or None, optional
+        Publish ready summaries after each condition, default None.
 
     Returns
     -------
@@ -304,6 +308,8 @@ def evaluate_fixed(
         if smoke_batches is None:
             write_json(path, saved)
         outputs[name] = saved
+        if publish is not None and smoke_batches is None:
+            publish(outputs)
         print(f"Completed fixed-mask condition: {name}", flush=True)
     return outputs
 
@@ -335,6 +341,9 @@ def plot_fixed(
     from .reporting import Report
 
     report = Report(reports, fit, step, [], settings)
+    index_path = reports / "output_index.csv"
+    if index_path.exists():
+        report.entries = pd.read_csv(index_path).to_dict("records")
     metrics = ("l1", "content_l1", "total_loss")
     rows, frequency_rows = [], []
     for name, result in outputs.items():
@@ -375,38 +384,46 @@ def plot_fixed(
         "joint": ("#D55E00", "-.", "^"),
     }
     titles = ("L1", "Content L1", "Total loss")
-    fig, axes = plt.subplots(1, 3, figsize=(23, 7))
-    for ax, metric, title in zip(axes, metrics, titles):
-        for kind in ("temporal", "joint"):
-            subset = overall[overall["mask"] == kind].sort_values(
-                "duration_ms"
+    complete_durations = [
+        d for d in sorted(overall.duration_frames.unique()) if d
+        and f"temporal_{d}" in outputs and f"joint_{d}" in outputs
+    ]
+    expected = next(iter(outputs.values()))["identity"][
+        "configuration"
+    ]["durations_frames"]
+    if set(complete_durations) == set(expected):
+        fig, axes = plt.subplots(1, 3, figsize=(23, 7))
+        for ax, metric, title in zip(axes, metrics, titles):
+            for kind in ("temporal", "joint"):
+                subset = overall[overall["mask"] == kind].sort_values(
+                    "duration_ms"
+                )
+                color, style, marker = styles[kind]
+                ax.plot(
+                    subset.duration_ms, subset[f"relative_{metric}"],
+                    color=color, ls=style, marker=marker, lw=2.5,
+                    label=kind.capitalize(),
+                )
+            spectral = overall[overall["mask"] == "spectral"].iloc[0]
+            ax.axhline(
+                spectral[f"relative_{metric}"], color=styles["spectral"][0],
+                ls="--", lw=2.5, label="Spectral",
             )
-            color, style, marker = styles[kind]
-            ax.plot(
-                subset.duration_ms, subset[f"relative_{metric}"],
-                color=color, ls=style, marker=marker, lw=2.5,
-                label=kind.capitalize(),
-            )
-        spectral = overall[overall["mask"] == "spectral"].iloc[0]
-        ax.axhline(
-            spectral[f"relative_{metric}"], color=styles["spectral"][0],
-            ls="--", lw=2.5, label="Spectral",
+            ax.axhline(1, color="0.5", ls=":", label="Constant prediction")
+            ticks = overall[overall["mask"] == "temporal"]
+            ax.set_xticks(ticks.duration_ms, [
+                f"{row.duration_ms:.0f} ms\n({row.duration_frames} frames)"
+                for row in ticks.itertuples()
+            ])
+            ax.set_xlabel("Temporal mask duration")
+            ax.set_ylabel("Loss / constant prediction loss")
+            ax.set_title(title)
+        report.figure(
+            f"{prefix}/frequency/duration_comparison", fig,
+            "Mask duration and relative reconstruction loss; "
+            f"validation-selected checkpoint {step}",
         )
-        ax.axhline(1, color="0.5", ls=":", label="Constant prediction")
-        ticks = overall[overall["mask"] == "temporal"]
-        ax.set_xticks(ticks.duration_ms, [
-            f"{row.duration_ms:.0f} ms\n({row.duration_frames} frames)"
-            for row in ticks.itertuples()
-        ])
-        ax.set_xlabel("Temporal mask duration")
-        ax.set_ylabel("Loss / constant prediction loss")
-        ax.set_title(title)
-    report.figure(
-        f"{prefix}/frequency/duration_comparison", fig,
-        "Mask duration and relative reconstruction loss; "
-        f"validation-selected checkpoint {step}",
-    )
-    for duration in sorted(overall.duration_frames.unique()):
+    for duration in complete_durations:
         if not duration:
             continue
         fig, ax = plt.subplots(figsize=(13, 8))
@@ -428,4 +445,37 @@ def plot_fixed(
             f"({duration * frame_hop_ms:.0f} ms); "
             f"validation-selected checkpoint {step}",
         )
+    if set(complete_durations) == set(expected):
+        from .storage import atomic_write, file_digest
+
+        ready = reports / "figures/test/fixed_masks/frequency"
+        required = [ready / "duration_comparison.png"] + [
+            ready / f"duration_{duration}.png" for duration in expected
+        ]
+        if all(path.exists() for path in required):
+            archive = reports.parent / (
+                "diagnostics/fixed_masks/previous_reports"
+            )
+            removed = set()
+            for pattern in (
+                "frequency_reconstruction*.png", "frequency_coverage*.png",
+            ):
+                for old in (reports / "figures/test").glob(pattern):
+                    archive.mkdir(parents=True, exist_ok=True)
+                    destination = archive / old.name
+                    if destination.exists():
+                        if file_digest(old) != file_digest(destination):
+                            raise ValueError(
+                                "Archived frequency figure differs."
+                            )
+                        old.unlink()
+                    else:
+                        old.rename(destination)
+                    removed.add(str(old.relative_to(reports)))
+            index = pd.read_csv(index_path)
+            index = index[~index.output.isin(removed)]
+            atomic_write(
+                index_path, lambda p: index.to_csv(p, index=False),
+                lambda p: pd.read_csv(p),
+            )
     print(f"Fixed-mask reports saved: {reports.resolve()}", flush=True)

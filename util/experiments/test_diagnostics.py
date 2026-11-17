@@ -225,6 +225,11 @@ def repair(
                     "checkpoint_step": state["completed_steps"],
                 },
                 device, workers, progress, smoke_batches,
+                publish=lambda ready: plot_fixed(
+                    ready, task.dataset.extracter.frequency_axis(),
+                    float(fixed.frame_hop_ms), reports, fit,
+                    state["completed_steps"], settings,
+                ),
             )
             if smoke_batches is None:
                 plot_fixed(

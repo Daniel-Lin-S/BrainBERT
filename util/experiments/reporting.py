@@ -702,6 +702,11 @@ def frequency_figures(
 ) -> None:
     """Plot actual-bin frequency errors and selection rates."""
     for phase in phases:
+        replacement = report.root / (
+            "figures/test/fixed_masks/frequency/duration_comparison.png"
+        )
+        if phase == "test" and replacement.exists():
+            continue
         name = f"{phase}_frequency"
         if name not in history:
             for suffix in ("", "_normalized"):
