@@ -41,3 +41,8 @@ tables only. Validation rank remains a figure showing its training trajectory.
 Figure legends are shared across panels with matching series. E1, E2, etc.
 mark completed epochs; the dotted vertical line marks the selected checkpoint.
 The constant prediction L1 baseline predicts zero at every standardized cell.
+
+Frequency reconstruction figures contain raw L1 and content L1 only. Separate
+`frequency_reconstruction_normalized.png` figures divide each loss by its
+matching constant-prediction loss, with a reference at one. Both figures identify
+the validation-selected checkpoint in their titles.

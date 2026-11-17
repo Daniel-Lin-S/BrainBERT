@@ -668,7 +668,7 @@ def condition_figures(report: Report, history: dict) -> None:
                 report.figure(
                     f"{folder}/mask_conditions/{family}/selected_checkpoint",
                     fig,
-                    f"{phase.title()} mask conditions at checkpoint "
+                    f"{phase.title()} mask conditions at validation-selected checkpoint "
                     f"{report.best}",
                 )
 
@@ -683,11 +683,12 @@ def frequency_figures(
     for phase in phases:
         name = f"{phase}_frequency"
         if name not in history:
-            report.register(
-                f"figures/{phase}/frequency/reconstruction.png",
-                f"{phase} frequency diagnostics",
-                "pending",
-            )
+            for suffix in ("", "_normalized"):
+                report.register(
+                    f"figures/{phase}/frequency/reconstruction{suffix}.png",
+                    f"{phase} frequency diagnostics",
+                    "pending",
+                )
             continue
         frame = history[name]
         report.table(
@@ -722,32 +723,32 @@ def frequency_figures(
                 "checkpoint cells use actual step spacing",
             )
         snapshot = frame[frame.step == report.best]
-        fig, axes = plt.subplots(2, 2, figsize=(16, 11))
-        for ax, key in zip(axes.flat, METRICS):
-            line_panel(
-                ax,
-                snapshot,
-                "frequency_hz",
-                key,
-                "strategy",
-                key.startswith("relative"),
+        if snapshot.empty:
+            raise ValueError(
+                f"No {phase} frequency rows for selected step {report.best}."
             )
-            if key == "l1":
-                baseline = snapshot[snapshot.strategy == "all"]
-                ax.plot(
-                    baseline.frequency_hz,
-                    baseline.zero_baseline_l1,
-                    color="gray",
-                    ls=":",
-                    label="constant prediction L1",
+        for normalized, keys in (
+            (False, ("l1", "content_l1")),
+            (True, ("relative_l1", "relative_content_l1")),
+        ):
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+            for ax, key in zip(axes, keys):
+                line_panel(
+                    ax, snapshot, "frequency_hz", key, "strategy", normalized
                 )
-            ax.set_xlabel("Frequency (Hz)")
-        report.figure(
-            f"{phase}/frequency/reconstruction",
-            fig,
-            f"{phase.title()} frequency reconstruction at "
-            f"checkpoint {report.best}",
-        )
+                ax.set_xlabel("Frequency (Hz)")
+            suffix = "_normalized" if normalized else ""
+            description = (
+                "frequency losses normalised by constant prediction L1"
+                if normalized
+                else "frequency reconstruction losses"
+            )
+            report.figure(
+                f"{phase}/frequency/reconstruction{suffix}",
+                fig,
+                f"{phase.title()} {description}; "
+                f"validation-selected checkpoint {report.best}",
+            )
     if not coverage_enabled:
         return
     coverage = history["frequency_coverage"]
