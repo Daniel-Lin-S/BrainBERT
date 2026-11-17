@@ -47,12 +47,12 @@ LABELS = {
     "total_loss": "Total loss",
     "l1": "L1",
     "content_l1": "Content L1",
-    "relative_l1": "Relative L1",
-    "relative_content_l1": "Relative content L1",
-    "std_ratio": "SD ratio",
+    "relative_l1": "L1 / zero-baseline L1",
+    "relative_content_l1": "Content L1 /\nzero-baseline content L1",
+    "std_ratio": "Prediction / target\nstandard deviation",
     "effective_rank": "Effective rank",
-    "effective_rank_fraction": "Rank fraction",
-    "pca95_components": "PCA95 components",
+    "effective_rank_fraction": "Effective rank / attainable rank",
+    "pca95_components": "Components for 95% variance",
 }
 TABLES = (
     "epoch_metrics",
@@ -641,7 +641,7 @@ def frequency_figures(
         fig, ax = plt.subplots(figsize=(12, 6))
         line_panel(ax, frame, "frequency_hz", "selection_rate", "strategy")
         ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("Selection rate")
+        ax.set_ylabel("Selected / valid cells")
         ax.set_ylim(0, 1)
         report.figure(
             f"{folder}/frequency_coverage/coverage",
