@@ -78,6 +78,10 @@ def repair(
     cfg = OmegaConf.create(
         json.loads((fit / "provenance.json").read_text())["invocation"]
     )
+    fixed = (
+        OmegaConf.load(diagnostics_config).get("fixed_masks")
+        if diagnostics_config else None
+    )
     diagnostics = diagnostic_names(
         OmegaConf.load(diagnostics_config).get("test_diagnostics")
         if diagnostics_config
@@ -88,7 +92,7 @@ def repair(
         if report_config
         else cfg.exp.runner.get("reports")
     )
-    if not diagnostics and evaluation_config is None:
+    if not diagnostics and evaluation_config is None and not fixed:
         render(artifact_root, campaign, settings=settings)
         return
     evaluation = (
@@ -128,7 +132,10 @@ def repair(
             evaluation_root, fit, reports, evaluation.name, settings
         )
         return
-    if evaluation is None and manifest_path.exists() and smoke_batches is None:
+    if (
+        not fixed and evaluation is None and manifest_path.exists()
+        and smoke_batches is None
+    ):
         saved = read_table(manifest_path).iloc[0]
         if (
             saved.fit_id != fit_id
@@ -168,18 +175,20 @@ def repair(
     logs = Path(cfg.storage.logs).resolve() / campaign / invocation
     status_path = logs / "status/status.json"
 
-    def progress(done: int, total: int) -> None:
+    stages = {}
+
+    def progress(
+        done: int, total: int, stage: str = "test_diagnostics"
+    ) -> None:
+        stages[stage] = {
+            "completed_batches": done, "total_batches": total,
+        }
         write_json(
             status_path,
             {
                 "fit_id": fit_id,
-                "phase": "test_diagnostics",
-                "stages": {
-                    "test_diagnostics": {
-                        "completed_batches": done,
-                        "total_batches": total,
-                    }
-                },
+                "phase": stage,
+                "stages": stages,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -201,6 +210,33 @@ def repair(
         model = task.build_model(cfg.model)
         task.load_model_weights(model, state["model"], False)
         model.to(device).eval()
+        if fixed:
+            from .fixed_mask_diagnostics import evaluate_fixed, plot_fixed
+            from .storage import digest
+
+            outputs = evaluate_fixed(
+                task, model, cfg, OmegaConf.to_container(fixed, resolve=True),
+                campaign_root / "diagnostics" / "fixed_masks",
+                {
+                    "checkpoint_sha256": checkpoint_hash,
+                    "selection_sha256": digest(
+                        task.dataset.selection_manifest
+                    ),
+                    "checkpoint_step": state["completed_steps"],
+                },
+                device, workers, progress, smoke_batches,
+            )
+            if smoke_batches is None:
+                plot_fixed(
+                    outputs, task.dataset.extracter.frequency_axis(),
+                    float(fixed.frame_hop_ms), reports, fit,
+                    state["completed_steps"], settings,
+                )
+            write_json(status_path, {
+                "phase": "complete", "stages": stages, "fit_id": fit_id,
+            })
+            print(f"Fixed-mask diagnostics finished: {reports}", flush=True)
+            return
         criterion = task.build_criterion(cfg.criterion)
         subset = test_masked_dataset(
             task.test_set, evaluation.test_masking if evaluation else None

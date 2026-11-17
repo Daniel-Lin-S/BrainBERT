@@ -64,3 +64,22 @@ frequency figures. Zero and random conditions share one heatmap under
 `reports/figures/test/mask_conditions`. Tables remain separate by policy
 under `reports/tables/test/<name>`, with a combined mask-condition table. The original fit and test results remain
 immutable. Repeat invocations verify and reuse completed evaluations.
+
+
+### Fixed-mask test diagnostics
+
+The reusable `conf/diagnostics/fixed_masks.yaml` profile is selected with
+`--diagnostics-config` when replaying a completed fit. It leaves training,
+validation, and checkpoint selection unchanged. Missing or empty `fixed_masks`
+disables this diagnostic. Every temporal, spectral, and joint condition uses
+the complete pinned test benchmark. Spectral-bin assignments are balanced and
+reused across conditions; temporal gaps are nested at paired positions.
+
+The duration comparison reports L1, content L1, and total loss relative to
+the previous zero constant predictor, with raw objectives retained in CSV.
+Total loss is normalized by the constant predictor's combined objective.
+Frequency figures normalize errors by a frozen training-target mean for each
+frequency; joint curves score the time–frequency intersection. Small condition
+summaries and the training mean are cached under campaign diagnostics for
+resumption. Figures share `reports/figures/test/fixed_masks/frequency`;
+source tables reside under `reports/tables/test/fixed_masks`.

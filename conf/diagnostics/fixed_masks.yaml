@@ -1,0 +1,10 @@
+# Explicit test-only replay profile; training and validation are unchanged.
+test_diagnostics: []
+fixed_masks:
+  durations_frames: [4, 8, 14]
+  spectral_bins: 1
+  replacement: zero
+  joint_scoring: intersection
+  batches: 128
+  seed: 0
+  frame_hop_ms: 24.4140625

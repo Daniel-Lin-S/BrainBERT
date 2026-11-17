@@ -216,6 +216,8 @@ def figure_output(name: str) -> str:
     parts = name.split("/")
     if parts[0] == "optimization":
         parts = ["training", "optimization", *parts[1:]]
+    if len(parts) > 1 and parts[1] == "fixed_masks":
+        return f"figures/{'/'.join(parts)}.png"
     if "mask_conditions" in parts:
         folder = "/".join(parts[:2])
         filename = "_".join(parts[2:])
