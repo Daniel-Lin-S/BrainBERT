@@ -46,3 +46,18 @@ Frequency reconstruction figures contain raw L1 and content L1 only. Separate
 `frequency_reconstruction_normalized.png` figures divide each loss by its
 matching constant-prediction loss, with a reference at one. Both figures identify
 the validation-selected checkpoint in their titles.
+
+Future STFT experiments use the reusable `conf/evaluation/pretraining.yaml`
+profile for two separate test evaluations: 100% zero replacement and 100%
+random replacement. Training and validation retain their original masking.
+Checkpoint selection therefore remains based on the original validation loss.
+Replacement actions describe writes, not guaranteed value changes: a random
+replacement can coincidentally equal the original value.
+
+To reevaluate an existing checkpoint, add `--evaluation-config` and
+`--evaluation-name zero_only_v1` or `random_only_v1` to the test-diagnostics
+command. Each evaluation retains the frozen test-window membership and writes
+its own results, monitor tables, policy, checkpoint digest and completion
+checksums under the campaign's `evaluations/<name>` directory. Derived reports
+are under `reports/evaluations/<name>`. The original fit and test results remain
+immutable. Repeat invocations verify and reuse completed evaluations.

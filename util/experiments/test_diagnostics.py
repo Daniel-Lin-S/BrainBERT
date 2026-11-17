@@ -23,7 +23,13 @@ from .execution import configure_budgeted
 from .lifecycle import scientific_config
 from .monitoring import TrainingMonitor, diagnostic_names, rank_positions
 from .report_settings import report_settings
-from .reporting import read_table, render, verify_fit
+from .reporting import (
+    read_table,
+    render,
+    verify_fit,
+    render_test_evaluation as render_evaluation,
+)
+from util.mask_utils import replacement_thresholds, test_masked_dataset
 from .storage import atomic_write, file_digest, write_json
 
 REPLAY_RTOL = 1e-5
@@ -40,6 +46,8 @@ def repair(
     smoke_batches: int | None = None,
     diagnostics_config: Path | None = None,
     report_config: Path | None = None,
+    evaluation_config: Path | None = None,
+    evaluation_name: str | None = None,
 ) -> None:
     """Replay pinned test batches with bounded resources and atomic outputs.
 
@@ -80,14 +88,47 @@ def repair(
         if report_config
         else cfg.exp.runner.get("reports")
     )
-    if not diagnostics:
+    if not diagnostics and evaluation_config is None:
         render(artifact_root, campaign, settings=settings)
         return
+    evaluation = (
+        OmegaConf.load(evaluation_config) if evaluation_config else None
+    )
+    if evaluation is not None and "test_evaluations" in evaluation:
+        if evaluation_name not in evaluation.test_evaluations:
+            raise ValueError("Select a configured --evaluation-name.")
+        evaluation = OmegaConf.create(
+            {
+                "name": evaluation_name,
+                "test_masking": evaluation.test_evaluations[evaluation_name],
+            }
+        )
+    if evaluation is not None:
+        replacement_thresholds(evaluation.test_masking)
+        if Path(evaluation.name).name != evaluation.name:
+            raise ValueError("Evaluation name must be one path component.")
+        evaluation_root = campaign_root / "evaluations" / evaluation.name
     reports = campaign_root / "reports"
     manifest_path = reports / "tables/test/diagnostic_manifest.csv"
     checkpoint = fit / "checkpoints/checkpoint_best.pth"
     checkpoint_hash = file_digest(checkpoint)
-    if manifest_path.exists() and smoke_batches is None:
+    if evaluation is not None and (evaluation_root / "complete.json").exists():
+        saved = json.loads((evaluation_root / "complete.json").read_text())
+        if (
+            saved["policy"] != OmegaConf.to_container(evaluation.test_masking)
+            or saved["checkpoint_sha256"] != checkpoint_hash
+        ):
+            raise ValueError(
+                "Completed evaluation has different policy/checkpoint."
+            )
+        for name, checksum in saved["files"].items():
+            if file_digest(evaluation_root / name) != checksum:
+                raise ValueError(f"Evaluation checksum differs: {name}")
+        render_evaluation(
+            evaluation_root, fit, reports, evaluation.name, settings
+        )
+        return
+    if evaluation is None and manifest_path.exists() and smoke_batches is None:
         saved = read_table(manifest_path).iloc[0]
         if (
             saved.fit_id != fit_id
@@ -114,7 +155,7 @@ def repair(
             artifact_root, campaign, diagnostics_only=True, settings=settings
         )
         return
-    if not reports.joinpath("output_index.csv").exists():
+    if evaluation is None and not reports.joinpath("output_index.csv").exists():
         raise ValueError("Generate available saved-data reports before replay.")
     if not torch.cuda.is_available() or not device.startswith("cuda"):
         raise RuntimeError("Test replay requires an available CUDA device.")
@@ -161,7 +202,9 @@ def repair(
         task.load_model_weights(model, state["model"], False)
         model.to(device).eval()
         criterion = task.build_criterion(cfg.criterion)
-        subset = task.test_set
+        subset = test_masked_dataset(
+            task.test_set, evaluation.test_masking if evaluation else None
+        )
         if smoke_batches is not None:
             subset = torch.utils.data.Subset(
                 subset,
@@ -198,6 +241,88 @@ def repair(
                 f"{torch.cuda.max_memory_allocated()}",
                 flush=True,
             )
+            return
+        if evaluation is not None:
+            if evaluation_root.exists():
+                raise ValueError(
+                    "Incomplete evaluation exists; inspect before retrying."
+                )
+            stats = output["monitor_accumulator"]
+            if stats.sums.reshape(3, 3, -1)[:, 2, 0].sum() != 0:
+                raise ValueError(
+                    "Zero/random evaluation contains unchanged targets."
+                )
+            with_monitor = TrainingMonitor(
+                evaluation_root / "monitoring",
+                task.dataset.extracter.frequency_axis(),
+                cfg.criterion.alpha,
+                CONTENT_THRESHOLD,
+                1,
+                cfg.preprocessor.normalizing,
+                tensorboard=False,
+            )
+            try:
+                with_monitor.record(
+                    "test",
+                    state["completed_steps"],
+                    stats,
+                    checkpoint_step=state["completed_steps"],
+                    plot_images=False,
+                )
+                if "representation_rank" in diagnostics:
+                    with_monitor.record_rank(
+                        state["completed_steps"],
+                        output["rank_embeddings"],
+                        phase="test",
+                    )
+                if "frequency_errors" in diagnostics:
+                    with_monitor.record_frequency(
+                        state["completed_steps"],
+                        stats,
+                        phase="test",
+                    )
+            finally:
+                with_monitor.close()
+            scalar = {
+                k: v
+                for k, v in output.items()
+                if k not in {"monitor_accumulator", "rank_embeddings"}
+            }
+            write_json(evaluation_root / "results.json", scalar)
+            write_json(
+                evaluation_root / "complete.json",
+                {
+                    "fit_id": fit_id,
+                    "checkpoint_sha256": checkpoint_hash,
+                    "checkpoint_step": state["completed_steps"],
+                    "selection_digest": current["selection"],
+                    "policy": OmegaConf.to_container(evaluation.test_masking),
+                    "windows": len(subset),
+                    "batches": len(loader),
+                    "files": {
+                        str(p.relative_to(evaluation_root)): file_digest(p)
+                        for p in evaluation_root.rglob("*")
+                        if p.is_file()
+                    },
+                },
+            )
+            render_evaluation(
+                evaluation_root, fit, reports, evaluation.name, settings
+            )
+            write_json(
+                status_path,
+                {
+                    "fit_id": fit_id,
+                    "phase": "complete",
+                    "stages": {
+                        "test_diagnostics": {
+                            "completed_batches": len(loader),
+                            "total_batches": len(loader),
+                        }
+                    },
+                },
+            )
+            print(f"Test evaluation published: {evaluation_root}", flush=True)
             return
         expected = json.loads((fit / "results.json").read_text())
         for key in expected.keys() & output.keys():
@@ -321,6 +446,8 @@ def main() -> None:
     parser.add_argument("--smoke-batches", type=int)
     parser.add_argument("--diagnostics-config", type=Path)
     parser.add_argument("--report-config", type=Path)
+    parser.add_argument("--evaluation-config", type=Path)
+    parser.add_argument("--evaluation-name")
     args = parser.parse_args()
     repair(
         args.artifact_root,
@@ -330,6 +457,8 @@ def main() -> None:
         args.smoke_batches,
         args.diagnostics_config,
         args.report_config,
+        args.evaluation_config,
+        args.evaluation_name,
     )
 
 

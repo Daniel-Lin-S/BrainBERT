@@ -238,6 +238,7 @@ class Report:
         self.settings = report_settings(settings)
         self.root = root.resolve()
         self.fit = fit.name
+        self.fit_path = fit.resolve()
         self.best = best
         self.epochs = epochs
         self.entries = []
@@ -330,6 +331,8 @@ class Report:
         if not self.wants("figures", name):
             plt.close(fig)
             return
+        if meaning.startswith("Test") and hasattr(self, "test_label"):
+            meaning = meaning.replace("Test", self.test_label, 1)
         path = figure_output(name)
         for ax in fig.axes:
             ax.set_ylabel(textwrap.fill(ax.get_ylabel().replace("\n", " "), 22))
@@ -543,7 +546,7 @@ def learning_figures(report: Report, history: dict) -> None:
 
 def report_fit(report: Report) -> Path:
     """Resolve the shared fit associated with the campaign report."""
-    return report.root.parents[2] / "fits" / report.fit
+    return report.fit_path
 
 
 def condition_figures(report: Report, history: dict) -> None:
@@ -560,7 +563,7 @@ def condition_figures(report: Report, history: dict) -> None:
                 rows[(rows.strategy != "all") & (rows.action != "all")],
             ),
         ):
-            chosen = chosen.copy()
+            chosen = chosen[chosen["count"] > 0].copy()
             chosen["condition"] = chosen.strategy + " / " + chosen.action
             report.table(
                 f"{folder}/mask_conditions/{family}/metrics",
@@ -633,7 +636,18 @@ def condition_figures(report: Report, history: dict) -> None:
                     if family == "full_grid":
                         grid = snapshot.pivot(
                             index="strategy", columns="action", values=key
-                        ).reindex(index=STRATEGIES, columns=ACTIONS)
+                        ).reindex(
+                            index=[
+                                x
+                                for x in STRATEGIES
+                                if x in snapshot.strategy.values
+                            ],
+                            columns=[
+                                x
+                                for x in ACTIONS
+                                if x in snapshot.action.values
+                            ],
+                        )
                         grid = grid.rename(index=DISPLAY, columns=DISPLAY)
                         sns.heatmap(
                             grid,
@@ -896,6 +910,48 @@ def export_tables(report: Report, history: dict) -> None:
     )
 
 
+def render_test_evaluation(
+    evaluation_root: Path,
+    fit: Path,
+    reports: Path,
+    name: str,
+    settings: dict,
+    checkpoint_step: int | None = None,
+) -> None:
+    """Publish one named test policy using shared tables and plot styling."""
+    if not reports_requested(settings):
+        return
+    settings = {**settings, "splits": ["test"]}
+    if (evaluation_root / "complete.json").exists():
+        metadata = json.loads((evaluation_root / "complete.json").read_text())
+        checkpoint_step = metadata["checkpoint_step"]
+        policy = metadata["policy"]
+    else:
+        policy = json.loads((evaluation_root / "policy.json").read_text())
+    if checkpoint_step is None:
+        raise ValueError(
+            "A named evaluation needs its selected checkpoint step."
+        )
+    history = load_history(evaluation_root)
+    report = Report(
+        reports / "evaluations" / name,
+        fit,
+        checkpoint_step,
+        [],
+        settings=settings,
+    )
+    description = ", ".join(
+        f"{100 * probability:g}% {action} replacement"
+        for action, probability in policy.items()
+        if probability
+    )
+    report.test_label = f"Test ({description})"
+    export_tables(report, history)
+    condition_figures(report, history)
+    frequency_figures(report, history, phases=("test",))
+    print(f"Test reports published: {report.root}", flush=True)
+
+
 def render(
     artifact_root: Path,
     campaign: str,
@@ -945,6 +1001,21 @@ def render(
         epoch_steps = sorted(history["epoch_metrics"].step.unique().tolist())
     else:
         epoch_steps = list(range(per_epoch, total + 1, per_epoch))
+    named_tests = list(
+        (fit / "monitoring").rglob("test_evaluations/*/monitoring/metrics.csv")
+    )
+    for path in named_tests:
+        evaluation_root = path.parent.parent
+        render_test_evaluation(
+            evaluation_root, fit, root, evaluation_root.name, settings, best
+        )
+    if named_tests:
+        settings = {
+            **settings,
+            "splits": [
+                phase for phase in settings["splits"] if phase != "test"
+            ],
+        }
     report = Report(
         root,
         fit,
