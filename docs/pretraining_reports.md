@@ -59,5 +59,8 @@ To reevaluate an existing checkpoint, add `--evaluation-config` and
 command. Each evaluation retains the frozen test-window membership and writes
 its own results, monitor tables, policy, checkpoint digest and completion
 checksums under the campaign's `evaluations/<name>` directory. Derived reports
-are under `reports/evaluations/<name>`. The original fit and test results remain
+use the shared `reports/figures/test` directory, with policy suffixes on
+frequency figures. Zero and random conditions share one heatmap under
+`reports/figures/test/mask_conditions`. Tables remain separate by policy
+under `reports/tables/test/<name>`, with a combined mask-condition table. The original fit and test results remain
 immutable. Repeat invocations verify and reuse completed evaluations.

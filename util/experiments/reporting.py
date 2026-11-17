@@ -8,6 +8,7 @@ No model fitting, feature extraction, or TensorBoard writes occur here.
 """
 
 import argparse
+import fcntl
 import io
 import json
 import math
@@ -318,6 +319,8 @@ class Report:
         if frame.empty or not self.wants("tables", name):
             return
         frame = frame.drop(columns=list(HIDDEN_SUMS), errors="ignore")
+        if name.startswith("test/") and hasattr(self, "policy_name"):
+            name = name.replace("test/", f"test/{self.policy_name}/", 1)
         path = f"tables/{name}.csv"
         atomic_write(
             self.root / path,
@@ -333,6 +336,8 @@ class Report:
             return
         if meaning.startswith("Test") and hasattr(self, "test_label"):
             meaning = meaning.replace("Test", self.test_label, 1)
+        if name.startswith("test/") and hasattr(self, "policy_name"):
+            name += f"_{self.policy_name}"
         path = figure_output(name)
         for ax in fig.axes:
             ax.set_ylabel(textwrap.fill(ax.get_ylabel().replace("\n", " "), 22))
@@ -910,6 +915,51 @@ def export_tables(report: Report, history: dict) -> None:
     )
 
 
+def combined_test_conditions(
+    reports: Path,
+    fit: Path,
+    settings: dict,
+    checkpoint_step: int,
+) -> None:
+    """Compare pure replacement evaluations without pooling their losses."""
+    sources = list((reports.parent / "evaluations").glob("*/complete.json"))
+    sources += list(
+        (fit / "monitoring").rglob("test_evaluations/*/policy.json")
+    )
+    frames = []
+    actions = set()
+    for source in sources:
+        metadata = json.loads(source.read_text())
+        policy = metadata.get("policy", metadata)
+        selected = [key for key, value in policy.items() if value == 1]
+        if len(selected) != 1 or selected[0] not in {"zero", "random"}:
+            continue
+        action = selected[0]
+        if action in actions:
+            raise ValueError(
+                f"Multiple completed test evaluations for {action}."
+            )
+        if metadata.get("checkpoint_step", checkpoint_step) != checkpoint_step:
+            raise ValueError("Test policies evaluated different checkpoints.")
+        frame = read_table(source.parent / "monitoring/mask_groups.csv")
+        frame = frame[(frame.action == action) & (frame.strategy != "all")]
+        frames.append(frame)
+        actions.add(action)
+    if actions != {"zero", "random"}:
+        return
+    selected_settings = {
+        **settings,
+        "figures": [x for x in settings["figures"] if x == "mask_full_grid"],
+        "tables": [x for x in settings["tables"] if x == "mask_full_grid"],
+    }
+    report = Report(reports, fit, checkpoint_step, [], selected_settings)
+    index = reports / "output_index.csv"
+    if index.exists():
+        report.entries = pd.read_csv(index).to_dict("records")
+    report.test_label = "Test (separate 100% zero and 100% random evaluations)"
+    condition_figures(report, {"mask_groups": pd.concat(frames)})
+
+
 def render_test_evaluation(
     evaluation_root: Path,
     fit: Path,
@@ -921,35 +971,44 @@ def render_test_evaluation(
     """Publish one named test policy using shared tables and plot styling."""
     if not reports_requested(settings):
         return
-    settings = {**settings, "splits": ["test"]}
-    if (evaluation_root / "complete.json").exists():
-        metadata = json.loads((evaluation_root / "complete.json").read_text())
-        checkpoint_step = metadata["checkpoint_step"]
-        policy = metadata["policy"]
-    else:
-        policy = json.loads((evaluation_root / "policy.json").read_text())
-    if checkpoint_step is None:
-        raise ValueError(
-            "A named evaluation needs its selected checkpoint step."
+    reports.mkdir(parents=True, exist_ok=True)
+    with (reports / ".test_report.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        settings = {**settings, "splits": ["test"]}
+        if (evaluation_root / "complete.json").exists():
+            metadata = json.loads(
+                (evaluation_root / "complete.json").read_text()
+            )
+            checkpoint_step = metadata["checkpoint_step"]
+            policy = metadata["policy"]
+        else:
+            policy = json.loads((evaluation_root / "policy.json").read_text())
+        if checkpoint_step is None:
+            raise ValueError(
+                "A named evaluation needs its selected checkpoint step."
+            )
+        history = load_history(evaluation_root)
+        report = Report(
+            reports,
+            fit,
+            checkpoint_step,
+            [],
+            settings=settings,
         )
-    history = load_history(evaluation_root)
-    report = Report(
-        reports / "evaluations" / name,
-        fit,
-        checkpoint_step,
-        [],
-        settings=settings,
-    )
-    description = ", ".join(
-        f"{100 * probability:g}% {action} replacement"
-        for action, probability in policy.items()
-        if probability
-    )
-    report.test_label = f"Test ({description})"
-    export_tables(report, history)
-    condition_figures(report, history)
-    frequency_figures(report, history, phases=("test",))
-    print(f"Test reports published: {report.root}", flush=True)
+        description = ", ".join(
+            f"{100 * probability:g}% {action} replacement"
+            for action, probability in policy.items()
+            if probability
+        )
+        report.policy_name = name
+        index = reports / "output_index.csv"
+        if index.exists():
+            report.entries = pd.read_csv(index).to_dict("records")
+        report.test_label = f"Test ({description})"
+        export_tables(report, history)
+        frequency_figures(report, history, phases=("test",))
+        combined_test_conditions(reports, fit, settings, checkpoint_step)
+        print(f"Test reports published: {report.root}", flush=True)
 
 
 def render(
@@ -1004,12 +1063,15 @@ def render(
     named_tests = list(
         (fit / "monitoring").rglob("test_evaluations/*/monitoring/metrics.csv")
     )
-    for path in named_tests:
-        evaluation_root = path.parent.parent
+    external_tests = list((base / "evaluations").glob("*/complete.json"))
+    for path in named_tests + external_tests:
+        evaluation_root = (
+            path.parent if path.name == "complete.json" else path.parent.parent
+        )
         render_test_evaluation(
             evaluation_root, fit, root, evaluation_root.name, settings, best
         )
-    if named_tests:
+    if named_tests or external_tests:
         settings = {
             **settings,
             "splits": [
@@ -1023,6 +1085,10 @@ def render(
         epoch_steps,
         settings=settings,
     )
+    if (named_tests or external_tests) and (root / "output_index.csv").exists():
+        report.entries = pd.read_csv(root / "output_index.csv").to_dict(
+            "records"
+        )
     if diagnostics_only:
         index = root / "output_index.csv"
         if index.exists():
