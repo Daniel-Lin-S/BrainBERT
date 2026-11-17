@@ -266,6 +266,33 @@ def execute(cfg: object) -> dict:
     configure_budgeted(cfg, task)
     resolve_training_steps(cfg, task)
     scientific = scientific_config(cfg, task.dataset, splits)
+    parent = cfg.exp.runner.get("parent_checkpoint")
+    if parent:
+        parent_path = Path(parent).resolve()
+        if file_digest(parent_path) != cfg.exp.runner.parent_checkpoint_sha256:
+            raise ValueError("Parent checkpoint checksum differs.")
+        previous = json.loads(
+            (parent_path.parent.parent / "scientific.json").read_text()
+        )
+        for field in ("model", "task", "preprocessor", "inventory", "splits",
+                      "selection"):
+            if previous[field] != scientific[field]:
+                raise ValueError(f"Continuation changes scientific {field}.")
+        if cfg.criterion.get("content_spectral_weighting", {}).get("apply"):
+            raise ValueError(
+                "Weighted experiment must initialise from scratch."
+            )
+        for key in ("name", "alpha"):
+            if previous["criterion"][key] != scientific["criterion"][key]:
+                raise ValueError("Continuation changes original objective.")
+    seed = cfg.exp.runner.get("seed")
+    if seed is not None:
+        import random
+        import numpy as np
+
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
     with FitRun(
         cfg.storage.artifacts, cfg.storage.logs, cfg.campaign, scientific
     ) as run:

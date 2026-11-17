@@ -23,6 +23,8 @@ from omegaconf import OmegaConf
 from .storage import digest, file_digest, write_json
 
 SCIENTIFIC_RUNNER = {
+    "early_stopping_patience", "seed", "parent_checkpoint_sha256",
+    "align_validation_steps",
     "lr",
     "optim",
     "train_batch_size",
@@ -37,6 +39,8 @@ SCIENTIFIC_RUNNER = {
     "checkpoint_step",
 }
 OPERATIONAL_RUNNER = {
+    "parent_checkpoint", "retain_epoch_checkpoints",
+    "fixed_validation", "fixed_training_baseline", "fixed_diagnostics",
     "test_masking", "test_evaluations",
     "test_diagnostics",
     "reports",

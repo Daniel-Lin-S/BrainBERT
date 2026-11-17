@@ -1,0 +1,7 @@
+defaults:
+  - pretrain_masked_criterion
+  - _self_
+content_spectral_weighting:
+  strength: 1.0
+  exponent: 2.0
+  apply: false

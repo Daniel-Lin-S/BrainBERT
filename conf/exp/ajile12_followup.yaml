@@ -1,0 +1,12 @@
+defaults:
+  - ajile12
+  - /diagnostics@runner.fixed_diagnostics: fixed_masks
+  - _self_
+runner:
+  total_steps: null
+  epochs: 20
+  seed: 2025
+  align_validation_steps: true
+  early_stopping_patience: 4
+  retain_epoch_checkpoints: true
+  fixed_validation: ${exp.runner.fixed_diagnostics.fixed_masks}

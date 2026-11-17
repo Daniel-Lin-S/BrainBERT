@@ -715,3 +715,67 @@ def test_tensorboard_toggle_keeps_scientific_identity():
         "figures": ["mask_margins"], "tables": ["overall_metrics"],
     }
     assert before == scientific_config(cfg, dataset, {})
+
+
+def test_spectral_content_weights_and_gradient():
+    """Weight only selected content and normalise by their total weight."""
+    from criterions.pretrain_masked_criterion import spectral_content_loss
+
+    errors = torch.tensor([[[2., 100., 4.]]], requires_grad=True)
+    content = torch.tensor([[[True, False, True]]])
+    frequencies = torch.tensor([0., 99.84, 199.68])
+    loss = spectral_content_loss(errors, content, frequencies, 1., 2.)
+    assert loss.item() == pytest.approx(10 / 3)
+    loss.backward()
+    torch.testing.assert_close(errors.grad, torch.tensor([[[1/3, 0., 2/3]]]))
+    assert spectral_content_loss(
+        errors, content, frequencies, 0., 2.,
+    ).item() == 3.
+
+
+def test_epoch_patience_and_retained_snapshots(tmp_path):
+    """Four non-improving epochs stop and persist all completed snapshots."""
+    task = SpecPretrain(OmegaConf.create({"name": "spec_pretrain"}))
+    extractor = STFTPreprocessor(
+        OmegaConf.load(ROOT / "conf/preprocessor/stft.yaml")
+    )
+    task.dataset = SimpleNamespace(extracter=extractor)
+    examples = [example() for _ in range(4)]
+    task.train_set = Subset(examples, [0, 1])
+    task.valid_set = Subset(examples, [2])
+    task.test_set = Subset(examples, [3])
+    criterion = PretrainMaskedCriterion()
+    criterion.build_criterion(OmegaConf.create({"alpha": 2.0}))
+    cfg = OmegaConf.create({
+        "artifact_dir": str(tmp_path / "checkpoints"),
+        "device": "cpu", "multi_gpu": False, "output_tb": False,
+        "quiet": True, "optim": "SGD", "lr": .001,
+        "total_steps": 40, "epochs": 20, "log_step": 1000,
+        "checkpoint_step": 1000, "epoch_end_validation": True,
+        "train_batch_size": 1, "valid_batch_size": 1, "num_workers": 0,
+        "shuffle": False, "grad_clip": 1.,
+        "early_stopping_patience": 4, "retain_epoch_checkpoints": True,
+        "scheduler": {"name": "ramp_up", "warmup": .1, "total_steps": 40},
+    })
+    runner = Runner(cfg, task, TinyModel(), criterion)
+    actual_valid = runner.get_valid_outs
+
+    def constant_validation():
+        result = actual_valid()
+        result["loss"] = 1.
+        return result
+
+    runner.get_valid_outs = constant_validation
+    try:
+        runner.train()
+        assert runner.completed_steps == 10
+        assert runner.stale_epochs == 4
+        assert runner.stopped_early
+        assert len(list((tmp_path / "checkpoints/epochs").glob("*.pth"))) == 5
+        last = torch.load(tmp_path / "checkpoints/checkpoint_last.pth",
+                          weights_only=False)
+        assert last["stale_epochs"] == 4 and last["stopped_early"]
+        assert not last["pending_fixed_validation"]
+    finally:
+        runner.progress.close()
+        runner.monitor.close()

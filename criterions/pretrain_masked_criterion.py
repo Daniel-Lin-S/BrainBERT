@@ -17,6 +17,42 @@ from .base_criterion import BaseCriterion
 CONTENT_THRESHOLD = 1.0
 
 
+
+def spectral_content_loss(
+    errors: torch.Tensor, content: torch.Tensor,
+    frequencies: torch.Tensor, strength: float, exponent: float,
+) -> torch.Tensor:
+    """Return a normalised weighted mean over selected content cells.
+
+    Parameters
+    ----------
+    errors : torch.Tensor
+        Absolute reconstruction errors, shape (B, T, F).
+    content : torch.Tensor
+        Selected content-cell mask, shape (B, T, F).
+    frequencies : torch.Tensor
+        Physical frequency centres, shape (F,).
+    strength, exponent : float
+        Nonnegative spectral emphasis and positive power.
+    """
+    import math
+
+    if (errors.shape != content.shape or errors.ndim != 3
+            or frequencies.shape != errors.shape[-1:]):
+        raise ValueError("Expected errors/mask (B,T,F) and frequencies (F,).")
+    if (not math.isfinite(strength) or strength < 0
+            or not math.isfinite(exponent) or exponent <= 0):
+        raise ValueError("Spectral strength must be >= 0 and power > 0.")
+    if (not torch.isfinite(frequencies).all() or frequencies.max() <= 0
+            or (frequencies < 0).any()):
+        raise ValueError("Spectral centres must be finite, nonnegative Hz.")
+    if not content.any() or not torch.isfinite(errors).all():
+        raise ValueError("Content loss needs finite errors and content cells.")
+    weights = 1 + strength * (frequencies / frequencies.max()).pow(exponent)
+    weights = weights.expand_as(errors).masked_select(content)
+    return (errors.masked_select(content) * weights).sum() / weights.sum()
+
+
 @register_criterion("pretrain_masked_criterion")
 class PretrainMaskedCriterion(BaseCriterion):
     def __init__(self):
@@ -80,7 +116,29 @@ class PretrainMaskedCriterion(BaseCriterion):
         non_zero = torch.mean(
             torch.abs(true_activity[non_zero_idxs] - predicted[non_zero_idxs])
         )
-        content_aware_loss = self.cfg.alpha * non_zero
+        comparison = {}
+        objective_content = non_zero
+        spectral = self.cfg.get("content_spectral_weighting")
+        if spectral is not None:
+            if not hasattr(self, "frequency_hz"):
+                raise ValueError("Spectral loss requires physical frequencies.")
+            weighted = spectral_content_loss(
+                (output - labels).abs(),
+                mask & (labels.abs() > CONTENT_THRESHOLD),
+                torch.as_tensor(self.frequency_hz, device=labels.device,
+                                dtype=labels.dtype),
+                spectral.strength, spectral.exponent,
+            )
+            comparison = {
+                "spectral_content_l1": weighted.item(),
+                "unweighted_total_loss": (
+                    l1 + self.cfg.alpha * non_zero
+                ).item(),
+                "spectral_total_loss": (l1 + self.cfg.alpha * weighted).item(),
+            }
+            if spectral.apply:
+                objective_content = weighted
+        content_aware_loss = self.cfg.alpha * objective_content
         loss = l1 + content_aware_loss
         if not torch.isfinite(loss):
             raise ValueError("Pre-training loss must be finite.")
@@ -96,6 +154,7 @@ class PretrainMaskedCriterion(BaseCriterion):
         if wav is not None:
             images["wav"] = wav
         logging_output = {
+            **comparison,
             "loss": loss.item(),
             "images": images,
             "l1_loss": l1.item(),

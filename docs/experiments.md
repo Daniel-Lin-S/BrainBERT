@@ -94,3 +94,25 @@ fitted moments are stored as model buffers and used for training, validation
 and test. Validation/test windows never contribute to fitting. Electrode IDs
 must be present in training; missing IDs fail explicitly. The standard STFT
 configuration continues to default to recording-wise normalization.
+
+
+### Objective follow-ups
+
+`ajile12_followup` uses a 20-epoch ceiling and four-epoch early stopping on
+the experiment's own regular-validation objective. `content_reference` logs
+both original and spectral content losses while optimising the original
+objective; `spectral_content` optimises the normalised spectral weighted
+mean. Both retain the outer content coefficient. Spectral weights use actual
+STFT frequencies and configurable strength/exponent.
+
+A continuation supplies a local `parent_checkpoint` and its scientific
+`parent_checkpoint_sha256`; data membership, architecture and the original
+objective are checked before restoration. Weighted experiments initialise
+from scratch. Each new fit owns its events, latest/best recovery state and
+weight-only completed-epoch snapshots. Original completed fits are immutable.
+
+Regular validation runs at completed-step intervals. The reusable fixed-mask
+profile adds epoch-wise validation diagnostics, with resumable condition sums
+and a frozen training-mean baseline. These shared-reference diagnostics do not
+select checkpoints or affect early stopping. Pending diagnostics and patience
+are restored with the latest checkpoint.

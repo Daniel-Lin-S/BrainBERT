@@ -73,6 +73,10 @@ class Runner:
         self.evaluator = None
         self.status_callback = None
         self.completed_steps = 0
+        self.stale_epochs = 0
+        self.epoch_best_at_start = float("inf")
+        self.stopped_early = False
+        self.pending_fixed_validation = False
         self.device = torch.device(cfg.device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
@@ -127,6 +131,18 @@ class Runner:
 
         if cfg.get("resume_from_ckpt") is not None:
             self.restore_managed_checkpoint()
+        elif cfg.get("parent_checkpoint"):
+            state = self.load_from_ckpt(cfg.parent_checkpoint)
+            self.completed_steps = state["completed_steps"]
+            self.progress.n = self.completed_steps
+            self.best_step = self.completed_steps
+            self.best_validation_loss = state["best_validation_loss"]
+            self.resumed_best_state = state["model"]
+            random.setstate(state["python_rng"])
+            np.random.set_state(state["numpy_rng"])
+            torch.set_rng_state(state["torch_rng"].cpu())
+            if torch.cuda.is_available():
+                restore_cuda_rng(state["cuda_rng"])
         elif "start_from_ckpt" in cfg:
             self.load_from_ckpt(cfg.start_from_ckpt)
 
@@ -137,6 +153,7 @@ class Runner:
             extractor = getattr(task.dataset, "extracter", None)
             if extractor is None:
                 extractor = STFTPreprocessor(task.dataset.preprocessor_cfg)
+            self.criterion.frequency_hz = extractor.frequency_axis()
             base = Path(self.exp_dir)
             root = base.parent if base.name == "checkpoints" else base
             monitor_root = Path(
@@ -181,6 +198,14 @@ class Runner:
             self.cfg.resume_best_ckpt,
             map_location=self.device, weights_only=False,
         )
+        self.pending_fixed_validation = last.get(
+            "pending_fixed_validation", False,
+        )
+        self.stale_epochs = last.get("stale_epochs", 0)
+        self.epoch_best_at_start = last.get(
+            "epoch_best_at_start", last["best_validation_loss"],
+        )
+        self.stopped_early = last.get("stopped_early", False)
         self.completed_steps = last["completed_steps"]
         self.progress.n = self.completed_steps
         self.best_step = last["best_step"]
@@ -327,6 +352,10 @@ class Runner:
         all_states = self.task.save_model_weights(
             self.model, all_states, self.cfg.multi_gpu
         )
+        all_states["pending_fixed_validation"] = self.pending_fixed_validation
+        all_states["stale_epochs"] = self.stale_epochs
+        all_states["epoch_best_at_start"] = self.epoch_best_at_start
+        all_states["stopped_early"] = self.stopped_early
         all_states["completed_steps"] = self.completed_steps
         all_states["best_step"] = self.best_step
         all_states["best_validation_loss"] = (
@@ -400,15 +429,19 @@ class Runner:
                     logging_out, self.cfg.grad_clip
                 )
             total_loss.append(logging_out["loss"])
+            validation_step = (
+                self.completed_steps if self.cfg.get("align_validation_steps")
+                else self.progress.n
+            )
             log_step = (
-                self.progress.n % self.cfg.log_step == 0
+                validation_step % self.cfg.log_step == 0
                 or self.progress.n == self.progress.total - 1
             )
 
             ckpt_step = False
             if self.cfg.checkpoint_step > -1:
                 ckpt_step = (
-                    self.progress.n % self.cfg.checkpoint_step == 0
+                    validation_step % self.cfg.checkpoint_step == 0
                     or self.progress.n == self.progress.total - 1
                 )
 
@@ -511,6 +544,91 @@ class Runner:
                 self.progress.update(1)
         return total_loss, (best_model, best_val)
 
+    def save_epoch_snapshot(self) -> None:
+        """Retain weight-only snapshots of completed epochs."""
+        if not self.cfg.get("retain_epoch_checkpoints", False):
+            return
+        if self.completed_steps % self.steps_per_epoch:
+            raise ValueError("Epoch snapshots require a completed data pass.")
+        epoch = self.completed_steps // self.steps_per_epoch
+        destination = Path(self.exp_dir) / "epochs" / f"epoch_{epoch:03d}.pth"
+        if destination.exists():
+            saved = torch.load(destination, map_location="cpu",
+                               weights_only=False)
+            if saved["completed_steps"] != self.completed_steps:
+                raise ValueError("Existing epoch snapshot has different steps.")
+            return
+        state = self.task.save_model_weights(
+            self.model, {}, self.cfg.multi_gpu,
+        )
+        state.update(epoch=epoch, completed_steps=self.completed_steps)
+        state["model_cfg"] = (
+            self.model.module.cfg if self.cfg.multi_gpu else self.model.cfg
+        )
+        atomic_write(destination, lambda p: torch.save(state, p),
+                     lambda p: torch.load(p, map_location="cpu",
+                                          weights_only=False))
+
+    def run_fixed_validation(self) -> None:
+        """Save shared-reference fixed-mask validation statistics per epoch.
+
+        Conditions use the complete pinned validation set, original content
+        coefficient and frozen training means. Diagnostic objectives use the
+        unweighted reference; regular validation selects each model using its
+        own optimised objective. No diagnostic updates the stopping state.
+        """
+        options = self.cfg.get("fixed_validation")
+        if not options:
+            return
+        from util.experiments.fixed_mask_diagnostics import (
+            balanced_bins, evaluate_conditions,
+        )
+        from util.mask_utils import test_masked_dataset
+        from omegaconf import OmegaConf
+        from util.experiments.storage import digest
+
+        dataset = test_masked_dataset(self.task.valid_set, targets_only=True)
+        if len(dataset) != options.batches * self.cfg.valid_batch_size:
+            raise ValueError(
+                "Fixed validation differs from pinned batch budget."
+            )
+        baseline = json.loads(
+            Path(self.cfg.fixed_training_baseline).read_text()
+        )
+        expected = digest(self.task.dataset.selection_manifest)
+        if baseline["identity"]["selection_sha256"] != expected:
+            raise ValueError("Frozen training means use a different selection.")
+        mean = torch.tensor(baseline["mean"], dtype=torch.float64)
+        durations = list(options.durations_frames)
+        conditions = [("spectral", "spectral", 0)] + [
+            (f"{kind}_{d}", kind, d) for d in durations
+            for kind in ("temporal", "joint")
+        ]
+        root = Path(self.exp_dir).parent / "diagnostics/validation_fixed"
+        root = root / f"epoch_{self.epoch_index:03d}"
+        identity = {
+            "step": self.completed_steps,
+            "selection_sha256": expected,
+            "configuration": OmegaConf.to_container(options),
+        }
+        destination = root / "results.json"
+        if destination.exists():
+            if json.loads(destination.read_text())["identity"] != identity:
+                raise ValueError("Fixed validation identity changed.")
+            return
+        self.model.eval()
+        result = evaluate_conditions(
+            self.task, dataset, self.model, [str(self.device)], conditions,
+            balanced_bins(len(dataset), len(mean), options.seed), mean,
+            durations, options.seed, self.criterion.cfg.alpha,
+            self.cfg.valid_batch_size, self.cfg.num_workers, root, identity,
+            lambda done, total, name: self.report_progress(
+                f"validation_fixed_{name}", done, total,
+            ), None,
+        )
+        write_json(destination, {"identity": identity, "conditions": result})
+        (root / "test_partial.json").unlink(missing_ok=True)
+
     def scheduler_step(self):
         pass
 
@@ -578,7 +696,25 @@ class Runner:
                 self.save_checkpoints()
             self.epoch_index = self.completed_steps // self.steps_per_epoch
             skipped = self.completed_steps % self.steps_per_epoch
-            while self.progress.n < self.progress.total:
+            if (self.cfg.get("parent_checkpoint")
+                    and not self.cfg.get("resume_from_ckpt")):
+                initial = self.get_valid_outs()["loss"]
+                self.best_validation_loss = float(initial)
+                best_state = (copy.deepcopy(self.model), {"loss": initial})
+                self.save_checkpoints(best_val=True)
+                self.save_epoch_snapshot()
+            if self.pending_fixed_validation:
+                self.run_fixed_validation()
+                self.pending_fixed_validation = False
+                self.save_checkpoints()
+            while (self.progress.n < self.progress.total
+                   and not self.stopped_early):
+                if not skipped:
+                    self.epoch_best_at_start = (
+                        self.best_validation_loss
+                        if self.best_validation_loss is not None
+                        else float("inf")
+                    )
                 self.epoch_index += 1
                 remaining = train_loader
                 if skipped:
@@ -596,6 +732,27 @@ class Runner:
                     epoch_complete=not bool(skipped),
                 )
                 skipped = 0
+                patience = self.cfg.get("early_stopping_patience")
+                if patience is not None:
+                    if type(patience) is not int or patience < 1:
+                        raise ValueError(
+                            "Early-stop patience must be positive."
+                        )
+                    improved = (
+                        self.best_validation_loss < self.epoch_best_at_start
+                    )
+                    self.stale_epochs = 0 if improved else self.stale_epochs + 1
+                    self.stopped_early = self.stale_epochs >= patience
+                self.save_epoch_snapshot()
+                self.pending_fixed_validation = bool(
+                    self.cfg.get("fixed_validation")
+                )
+                if self.cfg.checkpoint_step > 0:
+                    self.save_checkpoints()
+                self.run_fixed_validation()
+                self.pending_fixed_validation = False
+                if self.cfg.checkpoint_step > 0:
+                    self.save_checkpoints()
             self.progress.close()
         return best_state[0]
 

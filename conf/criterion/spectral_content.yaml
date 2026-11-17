@@ -1,0 +1,5 @@
+defaults:
+  - content_reference
+  - _self_
+content_spectral_weighting:
+  apply: true

@@ -206,6 +206,12 @@ class Accumulator:
         self.batches += 1
         for key in ORIGINAL_METRICS:
             self.original[key] += outs[key]
+        for key in (
+            "spectral_content_l1", "unweighted_total_loss",
+            "spectral_total_loss",
+        ):
+            if key in outs:
+                self.original[key] = self.original.get(key, 0.) + outs[key]
         if "grad_norm" in outs:
             norm = float(outs["grad_norm"])
             if not np.isfinite(norm):
