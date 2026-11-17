@@ -37,6 +37,7 @@ SCIENTIFIC_RUNNER = {
     "checkpoint_step",
 }
 OPERATIONAL_RUNNER = {
+    "test_masking", "test_evaluations",
     "test_diagnostics",
     "reports",
     "device",

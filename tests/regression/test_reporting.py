@@ -248,3 +248,87 @@ def test_figure_layout_groups_related_outputs():
         assert figure_output(f"{split}/representation/rank") == (
             f"figures/{split}/representation_rank.png"
         )
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"zero": 1, "random": 0, "unchanged": 0},
+        {"zero": 0, "random": 1, "unchanged": 0},
+    ],
+)
+def test_test_policy_preserves_training_and_excludes_unchanged(policy):
+    import random
+    import torch
+    from util.mask_utils import mask_inputs, test_masked_dataset
+
+    cfg = OmegaConf.create(
+        {
+            "mask_type": "variable",
+            "mask_p": 0.1,
+            "min_f": 0.01,
+            "max_f": 250,
+            "n_freq_steps": 40,
+        }
+    )
+    dataset = SimpleNamespace(task_cfg=cfg)
+    test = test_masked_dataset(dataset, policy)
+    assert "replacement_probabilities" not in dataset.task_cfg
+    assert test.task_cfg.replacement_probabilities == policy
+    state = random.getstate()
+    try:
+        random.seed(4)
+        _, mask, provenance = mask_inputs(
+            torch.ones(160, 40),
+            test.task_cfg,
+            return_provenance=True,
+        )
+        assert mask.bool().any()
+        assert (provenance["action"][mask.bool()] > 0).all()
+    finally:
+        random.setstate(state)
+
+
+def test_named_evaluations_keep_separate_monitors(tmp_path):
+    import json
+    from types import MethodType
+
+    runner = object.__new__(Runner)
+    runner.cfg = OmegaConf.create(
+        {
+            "test_evaluations": {
+                "zero": {"zero": 1, "random": 0, "unchanged": 0},
+                "random": {"zero": 0, "random": 1, "unchanged": 0},
+            }
+        }
+    )
+    original_cfg = runner.cfg
+    monitor = TrainingMonitor(
+        tmp_path / "monitoring",
+        np.arange(4.0),
+        2,
+        1,
+        1,
+        "recording_zscore",
+        tensorboard=False,
+    )
+    runner.monitor = monitor
+    observed = []
+
+    def evaluate(self, model, index, count):
+        observed.append((dict(self.cfg.test_masking), self.monitor.root))
+        assert count == 2
+        return {"loss": float(index)}
+
+    runner._test_once = MethodType(evaluate, runner)
+    try:
+        output = runner.test(object())
+        assert len(output["test_evaluations"]) == 2
+        assert runner.cfg is original_cfg and runner.monitor is monitor
+        for policy, root in observed:
+            assert (
+                json.loads((root.parent / "policy.json").read_text()) == policy
+            )
+        assert observed[0][1] != observed[1][1]
+    finally:
+        monitor.close()

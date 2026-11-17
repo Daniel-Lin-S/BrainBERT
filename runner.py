@@ -8,11 +8,14 @@ loss. A negative checkpoint interval disables disk saves, not model selection.
 """
 
 import copy
+import json
 import logging
 import os
 import random
 import warnings
 from pathlib import Path
+
+from omegaconf import open_dict
 
 import numpy as np
 import torch
@@ -597,6 +600,50 @@ class Runner:
         return best_state[0]
 
     def test(self, best_model: torch.nn.Module) -> dict:
+        """Evaluate explicitly named test policies with separate monitor outputs."""
+        policies = self.cfg.get("test_evaluations")
+        if not policies:
+            return self._test_once(best_model)
+        original_cfg, original_monitor = self.cfg, self.monitor
+        if original_monitor is None:
+            raise ValueError(
+                "Named test evaluations require lifecycle monitoring."
+            )
+        metadata = json.loads(
+            (original_monitor.root / "metadata.json").read_text()
+        )
+        results = {}
+        try:
+            for index, (name, policy) in enumerate(policies.items()):
+                if Path(name).name != name:
+                    raise ValueError(
+                        "Test evaluation name must be one path component."
+                    )
+                self.cfg = copy.deepcopy(original_cfg)
+                with open_dict(self.cfg):
+                    self.cfg.test_masking = policy
+                root = original_monitor.root / "test_evaluations" / name
+                self.monitor = TrainingMonitor(
+                    root / "monitoring", original_monitor.frequencies,
+                    original_monitor.alpha, metadata["content_threshold"],
+                    original_monitor.lr_groups,
+                    metadata["stft_normalization_mode"], tensorboard=False,
+                )
+                try:
+                    results[name] = self._test_once(
+                        best_model, index, len(policies)
+                    )
+                    write_json(root / "policy.json", dict(policy))
+                finally:
+                    self.monitor.close()
+        finally:
+            self.cfg, self.monitor = original_cfg, original_monitor
+        return {"test_evaluations": results}
+
+    def _test_once(
+        self, best_model: torch.nn.Module, policy_index: int = 0,
+        policy_count: int = 1,
+    ) -> dict:
         """Evaluate the validation-selected model on the held-out loader.
 
         Parameters
@@ -612,8 +659,13 @@ class Runner:
         if best_model is None:
             raise ValueError("Testing requires a validation-selected model.")
         best_model.eval()
+        from util.mask_utils import test_masked_dataset
+
+        test_set = test_masked_dataset(
+            self.task.test_set, self.cfg.get("test_masking")
+        )
         test_loader = self.get_batch_iterator(
-            self.task.test_set,
+            test_set,
             self.cfg.valid_batch_size,
             shuffle=False,
             num_workers=self.cfg.num_workers,
@@ -630,7 +682,9 @@ class Runner:
                 ),
                 collect_frequency="frequency_errors" in diagnostics,
                 progress_callback=lambda done, total:
-                self.report_progress("test", done, total),
+                self.report_progress(
+                    "test", policy_index * total + done, policy_count * total
+                ),
             )
         else:
             self.report_progress("test", 0, len(test_loader))

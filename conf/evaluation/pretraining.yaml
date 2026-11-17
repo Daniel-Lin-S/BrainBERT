@@ -1,0 +1,9 @@
+test_evaluations:
+  zero_only_v1:
+    zero: 1.0
+    random: 0.0
+    unchanged: 0.0
+  random_only_v1:
+    zero: 0.0
+    random: 1.0
+    unchanged: 0.0

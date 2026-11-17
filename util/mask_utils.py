@@ -8,6 +8,11 @@ last write, not equality of input and target. A no-op preserves prior writes.
 """
 
 import random
+import copy
+import math
+
+from omegaconf import OmegaConf, open_dict
+from torch.utils.data import Subset
 
 import numpy as np
 import torch
@@ -16,6 +21,56 @@ TEMPORAL = 1
 SPECTRAL = 2
 ZERO = 1
 RANDOM = 2
+
+
+def replacement_thresholds(policy: object = None) -> tuple[float, float]:
+    """Validate replacement probabilities and return cumulative thresholds.
+
+    Parameters
+    ----------
+    policy : mapping or None, optional
+        Zero, random, and unchanged probabilities; None uses original 80/10/10.
+    """
+    if policy is None:
+        return 0.1, 0.2
+    if set(policy) != {"zero", "random", "unchanged"}:
+        raise ValueError("Replacement policy needs zero, random, unchanged.")
+    values = [float(policy[k]) for k in ("zero", "random", "unchanged")]
+    if any(not math.isfinite(p) or p < 0 for p in values):
+        raise ValueError(
+            "Replacement probabilities must be finite and nonnegative."
+        )
+    if not math.isclose(sum(values), 1.0, abs_tol=1e-12):
+        raise ValueError("Replacement probabilities must sum to one.")
+    return values[2], values[2] + values[1]
+
+
+def test_masked_dataset(dataset: object, policy: object = None) -> object:
+    """Clone dataset configuration for test-only masking without mutating training.
+
+    Parameters
+    ----------
+    dataset : Dataset
+        Masked dataset, optionally nested in Subsets; sample indices stay fixed.
+    policy : mapping or None, optional
+        Explicit replacement probabilities; None leaves the dataset unchanged.
+    """
+    if policy is None:
+        return dataset
+    replacement_thresholds(policy)
+    if isinstance(dataset, Subset):
+        return Subset(
+            test_masked_dataset(dataset.dataset, policy), dataset.indices
+        )
+    if not hasattr(dataset, "task_cfg"):
+        raise ValueError("Test masking requires a dataset with task_cfg.")
+    cloned = copy.copy(dataset)
+    cloned.task_cfg = copy.deepcopy(dataset.task_cfg)
+    with open_dict(cloned.task_cfg):
+        cloned.task_cfg.replacement_probabilities = OmegaConf.create(
+            dict(policy)
+        )
+    return cloned
 
 
 def get_mask_fill_value(data):
@@ -48,6 +103,9 @@ def create_masked_intervals(
 def fixed_mask_inputs(
     data: torch.Tensor, task_cfg: object, return_provenance: bool = False
 ) -> tuple:
+    identity, random_end = replacement_thresholds(
+        task_cfg.get("replacement_probabilities")
+    )
     mask_label = torch.zeros_like(data)
     action = torch.zeros_like(data, dtype=torch.uint8)
 
@@ -67,9 +125,9 @@ def fixed_mask_inputs(
     mask_fill_value = get_mask_fill_value(data)
     for start, end in masked_steps:
         dice = random.random()
-        if dice < 0.1:  # TODO look at attentions
+        if dice < identity:  # TODO look at attentions
             pass
-        elif dice < 0.2:
+        elif dice < random_end:
             random_replace_start = random.randint(0, len(valid_starts) - 1)
             diff = end - start
             masked_data[start:end, :] = data[
@@ -92,9 +150,9 @@ def fixed_mask_inputs(
         selection[:, start:end] |= SPECTRAL
     for start, end in masked_steps:
         dice = random.random()
-        if dice < 0.1:  # TODO look at attentions
+        if dice < identity:  # TODO look at attentions
             pass
-        elif dice < 0.2:
+        elif dice < random_end:
             random_replace_start = valid_starts[
                 random.randint(0, len(valid_starts) - 1)
             ]
@@ -180,13 +238,16 @@ def variable_mask_time(
                 masked_positions.append(pos)
     # import pdb; pdb.set_trace()
     masked_data = torch.clone(data)
+    identity, random_end = replacement_thresholds(
+        task_cfg.get("replacement_probabilities")
+    )
     mask_label = torch.zeros_like(data)
     action = torch.zeros_like(data, dtype=torch.uint8)
     for position in masked_positions:
         dice = random.random()
-        if dice < 0.1:  # TODO look at attentions
+        if dice < identity:  # TODO look at attentions
             pass
-        elif dice < 0.2:
+        elif dice < random_end:
             random_position = valid_starts[
                 random.randint(0, len(valid_starts) - 1)
             ]
@@ -228,6 +289,9 @@ def variable_mask_freq(
     ]
 
     masked_data = torch.clone(data)
+    identity, random_end = replacement_thresholds(
+        task_cfg.get("replacement_probabilities")
+    )
     mask_label = torch.zeros_like(data)
     action = torch.zeros_like(data, dtype=torch.uint8)
 
@@ -235,9 +299,9 @@ def variable_mask_freq(
     for position in masked_positions:
         diff = idx2mask_size[position]
         dice = random.random()
-        if dice < 0.1:  # TODO look at attentions
+        if dice < identity:  # TODO look at attentions
             pass
-        elif dice < 0.2:
+        elif dice < random_end:
             random_replace_start = valid_starts[
                 random.randint(0, len(valid_starts) - 1)
             ]
