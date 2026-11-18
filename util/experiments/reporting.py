@@ -280,6 +280,7 @@ def figure_output(name: str) -> str:
     str
         Report-relative PNG path; margins and grids have distinct prefixes.
     """
+    name = name.replace("frequency_coverage/coverage", "frequency_coverage")
     parts = name.split("/")
     if parts[0] == "optimization":
         parts = ["training", "optimization", *parts[1:]]
@@ -396,6 +397,11 @@ class Report:
         frame = frame.drop(columns=list(HIDDEN_SUMS), errors="ignore")
         if name.startswith("test/") and hasattr(self, "policy_name"):
             name = name.replace("test/", f"test/{self.policy_name}/", 1)
+        if hasattr(self, "fixed_replacement"):
+            name = name.replace(
+                "test/fixed_masks/",
+                f"test/fixed_masks/{self.fixed_replacement}/", 1,
+            )
         path = f"tables/{name}.csv"
         atomic_write(
             self.root / path,
@@ -413,6 +419,12 @@ class Report:
             meaning = meaning.replace("Test", self.test_label, 1)
         if name.startswith("test/") and hasattr(self, "policy_name"):
             name += f"_{self.policy_name}"
+        if hasattr(self, "fixed_replacement"):
+            name = name.replace(
+                "test/fixed_masks/",
+                f"test/fixed_masks/{self.fixed_replacement}/", 1,
+            )
+            meaning += f"; {self.fixed_replacement} replacement"
         path = figure_output(name)
         for ax in fig.axes:
             ax.set_ylabel(textwrap.fill(ax.get_ylabel().replace("\n", " "), 22))
@@ -854,58 +866,14 @@ def frequency_figures(
     coverage_enabled: bool = True,
 ) -> None:
     """Plot actual-bin frequency errors and selection rates."""
-    for phase in phases:
-        replacement = report.root / (
-            "figures/test/fixed_masks/duration/constant_normalised.png"
-        )
-        if phase == "test" and replacement.exists():
-            continue
-        name = f"{phase}_frequency"
-        if name not in history:
-            for suffix in ("", "_normalized"):
-                report.register(
-                    f"figures/{phase}/frequency/reconstruction{suffix}.png",
-                    f"{phase} frequency diagnostics",
-                    "pending",
-                )
-            continue
-        frame = history[name]
+    if "validation" in phases and "validation_frequency" in history:
+        frame = history["validation_frequency"]
         report.table(
-            f"{phase}/frequency/reconstruction",
-            frame,
-            "Per-bin errors use their own selected/content counts",
+            "validation/frequency/reconstruction", frame,
+            "Variable-mask validation history for epoch evolution only",
         )
-        if not report.wants("figures", f"{phase}/frequency/reconstruction"):
-            continue
-        if phase == "validation":
+        if report.wants("figures", "validation/frequency/evolution"):
             frequency_evolution(report, frame)
-        snapshot = frame[frame.step == report.best]
-        if snapshot.empty:
-            raise ValueError(
-                f"No {phase} frequency rows for selected step {report.best}."
-            )
-        for normalized, keys in (
-            (False, ("l1", "content_l1")),
-            (True, ("relative_l1", "relative_content_l1")),
-        ):
-            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-            for ax, key in zip(axes, keys):
-                line_panel(
-                    ax, snapshot, "frequency_hz", key, "strategy", normalized
-                )
-                ax.set_xlabel("Frequency (Hz)")
-            suffix = "_normalized" if normalized else ""
-            description = (
-                "frequency losses normalised by constant prediction L1"
-                if normalized
-                else "frequency reconstruction losses"
-            )
-            report.figure(
-                f"{phase}/frequency/reconstruction{suffix}",
-                fig,
-                f"{phase.title()} {description}; "
-                f"validation-selected checkpoint {report.best}",
-            )
     if not coverage_enabled:
         return
     coverage = history["frequency_coverage"]

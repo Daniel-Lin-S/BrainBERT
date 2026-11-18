@@ -633,52 +633,7 @@ class TrainingMonitor:
                     f"{phase}/frequency/relative_l1",
                     pooled[ratios, 1] / pooled[ratios, 4], step,
                 )
-        if self.writer is not None and plot_image and phase == "validation":
-            self._frequency_reconstruction_plot(step, pooled)
         self.flush()
-
-    def _frequency_reconstruction_plot(
-        self, step: int, pooled: np.ndarray
-    ) -> None:
-        """Plot validation L1 and baseline ratio at actual STFT bins."""
-        import textwrap
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-
-        observed = pooled[:, 0] > 0
-        baseline = pooled[:, 4] > 0
-        if not np.any(observed):
-            return
-        with sns.axes_style("whitegrid"), sns.plotting_context("talk"):
-            fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-            sns.lineplot(
-                x=self.frequencies[observed],
-                y=pooled[observed, 1] / pooled[observed, 0],
-                ax=axes[0], linewidth=2.5,
-            )
-            if np.any(baseline):
-                sns.lineplot(
-                    x=self.frequencies[baseline],
-                    y=pooled[baseline, 1] / pooled[baseline, 4],
-                    ax=axes[1], linewidth=2.5,
-                )
-            axes[1].axhline(1, color="gray", linestyle="--")
-            axes[0].set_ylabel("L1 (standardized magnitude)")
-            axes[1].set_ylabel("L1 / constant prediction L1")
-            axes[1].set_xlabel("Frequency (Hz)")
-            axes[1].set_xlim(
-                self.frequencies[0], self.frequencies[-1]
-            )
-            axes[0].set_ylim(bottom=0)
-            axes[1].set_ylim(bottom=0)
-            fig.suptitle(textwrap.fill(
-                "Validation masked reconstruction across frequency", 50
-            ), y=0.99)
-            fig.tight_layout(rect=(0, 0, 1, 0.94))
-            self.writer.add_figure(
-                "validation/frequency/reconstruction", fig, step
-            )
-            plt.close(fig)
 
     def record_epoch(
         self, epoch: int, step: int, validation: Accumulator,

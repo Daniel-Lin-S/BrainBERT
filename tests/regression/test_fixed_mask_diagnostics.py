@@ -87,7 +87,8 @@ class _DiagnosticTask:
         return torch.utils.data.DataLoader(dataset, size, **kwargs)
 
 
-def test_shared_stream_matches_serial_and_resumes(tmp_path):
+@pytest.mark.parametrize("replacement", ["zero", "random"])
+def test_shared_stream_matches_serial_and_resumes(tmp_path, replacement):
     """Device scheduling and resumption preserve batch reduction order."""
     from util.experiments.fixed_mask_diagnostics import evaluate_conditions
 
@@ -106,6 +107,7 @@ def test_shared_stream_matches_serial_and_resumes(tmp_path):
             _DiagnosticTask(), dataset, _DiagnosticModel(), devices,
             conditions, bins, torch.ones(4), [4, 8, 14], 0, 2.,
             4, 0, root, {"test": "paired"}, lambda *args: None, None,
+            replacement=replacement,
         )
 
     serial = run(["cpu"], tmp_path / "serial")

@@ -285,30 +285,40 @@ def repair(
                     "phase": "complete", "stages": stages, "fit_id": fit_id,
                 })
                 return
-            outputs = evaluate_fixed(
-                task, model, cfg, OmegaConf.to_container(fixed, resolve=True),
-                campaign_root / "diagnostics" / "fixed_masks",
-                {
-                    "checkpoint_sha256": checkpoint_hash,
-                    "selection_sha256": digest(
-                        task.dataset.selection_manifest
-                    ),
-                    "checkpoint_step": state["completed_steps"],
-                },
-                device, workers, progress, smoke_batches,
-                devices=selected_devices,
-                publish=lambda ready: plot_fixed(
-                    ready, task.dataset.extracter.frequency_axis(),
-                    float(fixed.frame_hop_ms), reports, fit,
-                    state["completed_steps"], settings,
-                ),
-            )
-            if smoke_batches is None:
-                plot_fixed(
-                    outputs, task.dataset.extracter.frequency_axis(),
-                    float(fixed.frame_hop_ms), reports, fit,
-                    state["completed_steps"], settings,
+            replacements = fixed_options.pop("test_replacements")
+            if set(replacements) != {"zero", "random"}:
+                raise ValueError(
+                    "Fixed test diagnostics require zero and random policies."
                 )
+            for replacement in replacements:
+                def policy_progress(done, total, stage):
+                    progress(done, total, f"{replacement}/{stage}")
+
+                policy_options = {**fixed_options, "replacement": replacement}
+                outputs = evaluate_fixed(
+                    task, model, cfg, policy_options,
+                    campaign_root / "diagnostics" / "fixed_masks" / replacement,
+                    {
+                        "checkpoint_sha256": checkpoint_hash,
+                        "selection_sha256": digest(
+                            task.dataset.selection_manifest
+                        ),
+                        "checkpoint_step": state["completed_steps"],
+                    },
+                    device, workers, policy_progress, smoke_batches,
+                    devices=selected_devices,
+                    publish=lambda ready: plot_fixed(
+                        ready, task.dataset.extracter.frequency_axis(),
+                        float(fixed.frame_hop_ms), reports, fit,
+                        state["completed_steps"], settings,
+                    ),
+                )
+                if smoke_batches is None:
+                    plot_fixed(
+                        outputs, task.dataset.extracter.frequency_axis(),
+                        float(fixed.frame_hop_ms), reports, fit,
+                        state["completed_steps"], settings,
+                    )
             write_json(status_path, {
                 "phase": "complete", "stages": stages, "fit_id": fit_id,
             })

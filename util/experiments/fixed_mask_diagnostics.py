@@ -234,8 +234,8 @@ def evaluate_fixed(
         raise ValueError("Expected positive integer durations_frames.")
     if len(set(durations)) != len(durations):
         raise ValueError("Temporal durations must be unique.")
-    if options["spectral_bins"] != 1 or options["replacement"] != "zero":
-        raise ValueError("Fixed diagnostics require one bin and zero masking.")
+    if options["spectral_bins"] != 1 or options["replacement"] not in {"zero", "random"}:
+        raise ValueError("Fixed diagnostics require one bin and zero/random replacement.")
     if options["joint_scoring"] != "intersection":
         raise ValueError("Expected joint_scoring: intersection.")
     size = cfg.exp.runner.valid_batch_size
@@ -252,10 +252,20 @@ def evaluate_fixed(
             raise ValueError("Saved training baseline provenance differs.")
         mean = torch.tensor(baseline["mean"], dtype=torch.float64)
     else:
-        baseline = training_baseline(
-            task, training_targets, size, workers, root, identity,
-            progress, smoke_batches,
+        reference = options.get(
+            "training_baseline", cfg.exp.runner.get("fixed_training_baseline")
         )
+        if reference:
+            baseline = json.loads(Path(reference).read_text())
+            if (baseline["identity"]["selection_sha256"]
+                    != identity["selection_sha256"]):
+                raise ValueError("Training baseline selection differs.")
+            baseline = {**baseline, "identity": identity}
+        else:
+            baseline = training_baseline(
+                task, training_targets, size, workers, root, identity,
+                progress, smoke_batches,
+            )
         mean = torch.tensor(baseline["mean"], dtype=torch.float64)
         if smoke_batches is None:
             write_json(baseline_path, baseline)
@@ -283,6 +293,7 @@ def evaluate_fixed(
             task, test_targets, model, devices or [device], pending,
             bins, mean, durations, options["seed"], cfg.criterion.alpha,
             size, workers, root, identity, progress, smoke_batches,
+            replacement=options["replacement"],
         )
         for name, kind, duration in pending:
             result = evaluated[name]
@@ -357,11 +368,52 @@ def training_baseline(
     }
 
 
+def fixed_replacement(
+    target: torch.Tensor, padding: torch.Tensor,
+    temporal: torch.Tensor, spectral: torch.Tensor, kind: str,
+    indices: torch.Tensor, seed: int, replacement: str,
+) -> torch.Tensor:
+    """Apply pre-training replacement semantics to fixed-size masks.
+
+    Targets and masks have shape (B, T, F); padding has shape (B, T).
+    Random donors are drawn reproducibly within the same window. Temporal
+    writes precede spectral writes, matching pre-training overlap handling.
+    Returns a masked copy with shape (B, T, F).
+    """
+    if replacement not in {"zero", "random"}:
+        raise ValueError(f"Unsupported fixed replacement: {replacement}")
+    result = target.clone()
+    for row, index in enumerate(indices.tolist()):
+        length = int((~padding[row]).sum())
+        generator = torch.Generator().manual_seed(seed + index)
+        if kind in {"temporal", "joint"}:
+            selected = temporal[row, :, 0].nonzero().flatten()
+            width = len(selected)
+            donor = int(torch.randint(
+                length - width + 1, (1,), generator=generator,
+            ))
+            result[row, selected] = (
+                target[row, donor:donor + width]
+                if replacement == "random" else 0
+            )
+        if kind in {"spectral", "joint"}:
+            column = int(spectral[row, 0].nonzero().item())
+            donor = int(torch.randint(
+                target.shape[2], (1,), generator=generator,
+            ))
+            result[row, :length, column] = (
+                result[row, :length, donor].clone()
+                if replacement == "random" else 0
+            )
+    return result
+
+
 @torch.inference_mode()
 def condition_batch(
     model: torch.nn.Module, device: str, conditions: list,
     batch: dict, indices: torch.Tensor, bins: torch.Tensor,
     mean: torch.Tensor, durations: list[int], seed: int, alpha: float,
+    replacement: str = "zero",
 ) -> dict:
     """Evaluate assigned conditions using one device-local target transfer.
 
@@ -383,7 +435,11 @@ def condition_batch(
             selected = scored = spectral
         else:
             selected, scored = temporal | spectral, temporal & spectral
-        prediction, _ = model(target.masked_fill(selected, 0), padding)
+        masked = fixed_replacement(
+            target, padding, temporal, spectral, kind, indices, seed,
+            replacement,
+        )
+        prediction, _ = model(masked, padding)
         results[name] = reconstruction_statistics(
             prediction, target, selected, scored, mean, alpha,
         )
@@ -397,6 +453,7 @@ def evaluate_conditions(
     mean: torch.Tensor, durations: list[int], seed: int, alpha: float,
     size: int, workers: int, root: Path, identity: dict,
     progress: Callable, smoke_batches: int | None,
+    replacement: str = "zero",
 ) -> dict:
     """Share one test stream among independent device-owned conditions.
 
@@ -448,7 +505,7 @@ def evaluate_conditions(
             indices = torch.arange(offset, offset + len(batch["target"]))
             futures = [executor.submit(
                 condition_batch, replica, device, group, batch, indices,
-                bins, mean, durations, seed, alpha,
+                bins, mean, durations, seed, alpha, replacement,
             ) for replica, device, group in zip(
                 replicas, selected_devices, groups,
             )]
@@ -609,6 +666,9 @@ def plot_fixed(
         outputs, frequency_axis, frame_hop_ms, alpha,
     )
     report = Report(reports, fit, step, [], settings)
+    report.fixed_replacement = next(iter(outputs.values()))["identity"][
+        "configuration"
+    ]["replacement"]
     index = reports / "output_index.csv"
     if index.exists():
         report.entries = pd.read_csv(index).to_dict("records")
@@ -650,8 +710,6 @@ def plot_fixed(
             )
         if set(durations) == set(expected):
             plot_duration_losses(report, overall, durations, normalised)
-    if set(durations) == set(expected):
-        retire_fixed_figures(report, durations)
     print(f"Fixed-mask reports saved: {reports.resolve()}", flush=True)
 
 
@@ -744,56 +802,6 @@ def plot_duration_losses(
         f"test/fixed_masks/duration/{name}", fig,
         "Mask duration and reconstruction loss; "
         f"validation-selected checkpoint {report.best}",
-    )
-
-
-def retire_fixed_figures(report: Any, durations: Sequence[int]) -> None:
-    """Remove superseded derived figures only after replacements are audited.
-
-    Completed diagnostic JSONs are never modified. Legacy adaptive figures
-    remain archived separately from the active fixed-mask report tree.
-    """
-    import pandas as pd
-    from .storage import atomic_write, file_digest
-
-    prefix = "figures/test/fixed_masks"
-    replacements = [f"{prefix}/duration/{name}.png"
-                    for name in ("raw", "constant_normalised")]
-    replacements.extend(
-        f"{prefix}/frequency/{metric}/duration_{d}{suffix}.png"
-        for metric in LOSS_METRICS for d in durations
-        for suffix in ("", "_normalised")
-    )
-    if not all((report.root / name).exists() for name in replacements):
-        return
-    removed = set()
-    folders = ("frequency", "l1_by_frequency", "normalised_l1_by_frequency")
-    names = ["duration_comparison", *[f"duration_{d}" for d in durations]]
-    for folder in folders:
-        for name in names:
-            relative = f"{prefix}/{folder}/{name}.png"
-            (report.root / relative).unlink(missing_ok=True)
-            removed.add(relative)
-        directory = report.root / prefix / folder
-        if directory.exists() and not any(directory.iterdir()):
-            directory.rmdir()
-    archive = report.root.parent / "diagnostics/fixed_masks/previous_reports"
-    for pattern in ("frequency_reconstruction*.png", "frequency_coverage*.png"):
-        for old in (report.root / "figures/test").glob(pattern):
-            archive.mkdir(parents=True, exist_ok=True)
-            destination = archive / old.name
-            if destination.exists():
-                if file_digest(old) != file_digest(destination):
-                    raise ValueError("Archived frequency figure differs.")
-                old.unlink()
-            else:
-                old.rename(destination)
-            removed.add(str(old.relative_to(report.root)))
-    report.entries = [e for e in report.entries if e["output"] not in removed]
-    frame = pd.DataFrame(report.entries)
-    atomic_write(
-        report.root / "output_index.csv",
-        lambda p: frame.to_csv(p, index=False), lambda p: pd.read_csv(p),
     )
 
 
