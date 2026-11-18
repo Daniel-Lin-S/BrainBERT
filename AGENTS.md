@@ -6,7 +6,10 @@ Please use the conda environment specified in local configurations (e.g., `.vsco
 
 You should always grill me on ALL technical details and design choices rather than making guessworks or silently setting default values by yourself.
 
-Anti-example: I asked you to redesign the artifact figures, and you silently designed the content of one or several figures without checking details like x-y axis meanings, axis ticks, legends, plot timing with me.
+Anti-examples: 
+
+- I asked you to design the figures/plots, and you silently designed the content of one or several figures without checking details like x-y axis meanings, axis ticks, legends, plot timing with me.
+- Silently save logs / artifacts of a new experiments with those of previous experiments without asking whether the save path should be changed.
 
 ## Coding style
 
@@ -131,13 +134,23 @@ If the failure in one experiment is not fatal (definitely affects the following 
 
 NEVER retrain a model on a data / fold / session that already have completion records under the same configurations. (changines in invocation parameters like number of GPU/CPUs used should NOT restart already completed experiments)
 
+### Pre-training / long-epoch training restoration
+
+For the same training configurations (batch size, learning rate schedule, sampling strategy, data cohort, etc.), but larger number of epochs, please resume from previously completed checkpoint (e.g., if 10-epoch checkpoint exists, train on additional 10 epochs rather than restart the entire 20 epochs)
+
+- DONT resume checkpoint if training configurations changed
+- after resuming, the training losses and other metrics from previous run should still be cocllected in the report
+- DONT treat the first epoch after resuming as a genuine start point.
+
 ## Repository structure
 
-Please place files in dedicated modules. 
+Please place files (code scripts, logs, artifacts, figures) in dedicated modules.
 
 NEVER stack flat files under the repository root or a module root. Create appropriate modules or submodules (or subfolders).
 
 If a root / module has over 10 files, then you may need to examine whether breaking into subfolders is required. (this is not hard limit, there are situations where large number of files are required, e.g., in a data root with dozens of mat files belonging to different recordings, no appropriate partition exists)
+
+DONT attempt the other extreme -- creating too many folders and only place one file under each folder. 
 
 ## Evaluation and performance metrics
 
