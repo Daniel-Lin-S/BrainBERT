@@ -64,7 +64,7 @@ class PretrainMaskedCriterion(BaseCriterion):
 
     def forward(
         self, model, batch, device, embedding_rows=None,
-        collect_frequency=False,
+        collect_frequency=False, normalizers=None,
     ):
         """Compute the unchanged masked-cell objective and diagnostics.
 
@@ -80,6 +80,10 @@ class PretrainMaskedCriterion(BaseCriterion):
             Batch rows to pool into (N, D) final embeddings, default None.
         collect_frequency : bool, optional
             Collect validation frequency sums, default False.
+
+        normalizers : tuple or None, optional
+            Full optimizer-batch masked count, content count and spectral
+            weight sum for gradient accumulation, default None.
 
         Returns
         -------
@@ -106,16 +110,22 @@ class PretrainMaskedCriterion(BaseCriterion):
             raise ValueError(
                 "Pre-training requires at least one masked target."
             )
-        l1 = torch.mean(torch.abs(true_activity - predicted))
+        errors = torch.abs(true_activity - predicted)
+        masked_count = (
+            true_activity.numel() if normalizers is None else normalizers[0]
+        )
+        l1 = errors.sum() / masked_count
         non_zero_idxs = torch.abs(true_activity) > CONTENT_THRESHOLD
-        if not non_zero_idxs.any():
+        if not non_zero_idxs.any() and normalizers is None:
             raise ValueError(
                 "Content-aware loss requires a masked target with absolute "
                 f"value greater than {CONTENT_THRESHOLD}."
             )
-        non_zero = torch.mean(
-            torch.abs(true_activity[non_zero_idxs] - predicted[non_zero_idxs])
+        content_count = (
+            int(non_zero_idxs.sum()) if normalizers is None
+            else normalizers[1]
         )
+        non_zero = errors[non_zero_idxs].sum() / content_count
         comparison = {}
         objective_content = non_zero
         spectral = self.cfg.get("content_spectral_weighting")
@@ -128,7 +138,19 @@ class PretrainMaskedCriterion(BaseCriterion):
                 torch.as_tensor(self.frequency_hz, device=labels.device,
                                 dtype=labels.dtype),
                 spectral.strength, spectral.exponent,
-            )
+            ) if non_zero_idxs.any() else errors.sum() * 0
+            if normalizers is not None:
+                frequencies = torch.as_tensor(
+                    self.frequency_hz, device=labels.device,
+                    dtype=labels.dtype,
+                )
+                weights = 1 + spectral.strength * (
+                    frequencies / frequencies.max()
+                ).pow(spectral.exponent)
+                local_weight = weights.expand_as(labels).masked_select(
+                    mask & (labels.abs() > CONTENT_THRESHOLD)
+                ).sum()
+                weighted = weighted * local_weight / normalizers[2]
             comparison = {
                 "spectral_content_l1": weighted.item(),
                 "unweighted_total_loss": (
@@ -159,10 +181,12 @@ class PretrainMaskedCriterion(BaseCriterion):
             "images": images,
             "l1_loss": l1.item(),
             "content_l1": content_l1.item(),
-            "zero_baseline_l1": true_activity.abs().mean().item(),
+            "zero_baseline_l1": (
+                true_activity.abs().sum() / masked_count
+            ).item(),
             "content_zero_baseline_l1": (
-                true_activity[non_zero_idxs].abs().mean().item()
-            ),
+                true_activity[non_zero_idxs].abs().sum() / content_count
+            ).item(),
             "content_aware_loss": content_aware_loss.item(),
         }
         if embedding_rows:
@@ -186,3 +210,95 @@ class PretrainMaskedCriterion(BaseCriterion):
                 include_frequency=collect_frequency,
             )
         return loss, logging_output
+
+    def accumulated_backward(
+        self, model: torch.nn.Module, batch: dict, device: object,
+        microbatch_size: int,
+    ) -> dict:
+        """Backpropagate full-batch cell means through smaller forward passes.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            Reconstruction model, possibly DataParallel.
+        batch : dict
+            Collated spectra and masks of shape (B, T, F), with raw waveforms
+            and optional nested mask provenance of matching batch length.
+        device : object
+            Primary CUDA or CPU device.
+        microbatch_size : int
+            Positive maximum rows per forward pass.
+
+        Returns
+        -------
+        dict
+            Summed scalar losses and additive monitoring statistics. Images
+            describe the first microbatch. Gradients remain on the model.
+        """
+        if type(microbatch_size) is not int or microbatch_size <= 0:
+            raise ValueError("microbatch_size must be a positive integer.")
+        target = batch["target"]
+        mask = batch["mask_label"].bool()
+        content = mask & (target.abs() > CONTENT_THRESHOLD)
+        masked_count = int(mask.sum())
+        content_count = int(content.sum())
+        if masked_count == 0 or content_count == 0:
+            raise ValueError("Accumulation requires masked and content cells.")
+        weight_sum = float(content_count)
+        spectral = self.cfg.get("content_spectral_weighting")
+        if spectral is not None:
+            frequencies = torch.as_tensor(
+                self.frequency_hz, dtype=target.dtype, device=target.device,
+            )
+            weights = 1 + spectral.strength * (
+                frequencies / frequencies.max()
+            ).pow(spectral.exponent)
+            weight_sum = float(weights.expand_as(target)[content].sum())
+        normalizers = (masked_count, content_count, weight_sum)
+        merged = {}
+        for start in range(0, len(target), microbatch_size):
+            chunk = slice_batch(batch, start, start + microbatch_size)
+            loss, logged = self.forward(
+                model, chunk, device, normalizers=normalizers,
+            )
+            loss.backward()
+            for key, value in logged.items():
+                if key == "images":
+                    merged.setdefault(key, value)
+                elif key == "monitor_statistics":
+                    if key not in merged:
+                        merged[key] = value
+                    else:
+                        for field, array in value.items():
+                            merged[key][field] += array
+                else:
+                    merged[key] = merged.get(key, 0.0) + value
+        if not torch.isfinite(torch.tensor(merged["loss"])):
+            raise ValueError("Accumulated training loss must be finite.")
+        return merged
+
+
+def slice_batch(batch: dict, start: int, end: int) -> dict:
+    """Slice collated spectra (B,T,F), waveforms and nested provenance.
+
+    Parameters
+    ----------
+    batch : dict
+        Tensor/list leaves all share the batch dimension.
+    start, end : int
+        Half-open row range.
+
+    Returns
+    -------
+    dict
+        Views or list slices for the requested microbatch rows.
+    """
+    result = {}
+    for key, value in batch.items():
+        if isinstance(value, dict):
+            result[key] = slice_batch(value, start, end)
+        elif isinstance(value, (torch.Tensor, list, tuple)):
+            result[key] = value[start:end]
+        else:
+            raise TypeError(f"Cannot slice batch field {key}: {type(value)}.")
+    return result

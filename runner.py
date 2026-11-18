@@ -75,6 +75,8 @@ class Runner:
         self.evaluator = None
         self.status_callback = None
         self.completed_steps = 0
+        self.microbatch_ready_checks = 0
+        self.microbatch_last_check = -1
         self.stale_epochs = 0
         self.epoch_best_at_start = float("inf")
         self.stopped_early = False
@@ -359,6 +361,7 @@ class Runner:
         all_states["epoch_best_at_start"] = self.epoch_best_at_start
         all_states["stopped_early"] = self.stopped_early
         all_states["completed_steps"] = self.completed_steps
+        all_states["microbatch_size"] = self.cfg.get("microbatch_size")
         all_states["best_step"] = self.best_step
         all_states["best_validation_loss"] = (
             self.best_validation_loss
@@ -396,6 +399,62 @@ class Runner:
             raise
         previous.unlink(missing_ok=True)
 
+    def maybe_relax_microbatch(self) -> None:
+        """Increase forward rows after sustained measured CUDA headroom.
+
+        The configured optimizer batch remains fixed. Profiled target peaks
+        include model and optimizer allocations. Reclaimable allocator cache
+        contributes to available memory, bounded by the per-process cap.
+        Changes occur between optimizer updates and are recorded in logs and
+        subsequent checkpoints.
+        """
+        options = self.cfg.get("adaptive_microbatch")
+        current = self.cfg.get("microbatch_size")
+        if options is None or current is None or self.device.type != "cuda":
+            return
+        interval = options["check_interval"]
+        required = options["consecutive_checks"]
+        margin = options["margin_bytes"]
+        if interval <= 0 or required <= 0 or margin < 0:
+            raise ValueError("Adaptive microbatch policy has invalid limits.")
+        if (self.completed_steps <= 0
+                or self.completed_steps % interval
+                or self.completed_steps == self.microbatch_last_check):
+            return
+        self.microbatch_last_check = self.completed_steps
+        target = min(current * 2, self.cfg.train_batch_size)
+        peak = options["profile_peaks_bytes"][str(target)]
+        if peak <= 0:
+            raise ValueError("Adaptive target requires a positive profile peak.")
+        devices = (
+            range(torch.cuda.device_count()) if self.cfg.multi_gpu
+            else [self.device.index]
+        )
+        available = []
+        for device in devices:
+            free, total = torch.cuda.mem_get_info(device)
+            reusable = torch.cuda.memory_reserved(device)
+            cap = int(total * self.cfg.gpu_memory_fraction)
+            available.append(min(free + reusable, cap))
+        if not available:
+            raise ValueError("Adaptive microbatch policy found no CUDA devices.")
+        if min(available) < peak + margin:
+            self.microbatch_ready_checks = 0
+            return
+        self.microbatch_ready_checks += 1
+        if self.microbatch_ready_checks < required:
+            return
+        self.cfg.microbatch_size = (
+            None if target == self.cfg.train_batch_size else target
+        )
+        self.microbatch_ready_checks = 0
+        log.info(
+            "Optimizer step %s: forward batch %s -> %s after %s memory "
+            "checks; optimizer batch %s; available bytes %s",
+            self.completed_steps, current, target, required,
+            self.cfg.train_batch_size, available,
+        )
+
     def run_epoch(
         self, train_loader, total_loss, best_state,
         epoch_complete=True,
@@ -404,6 +463,7 @@ class Runner:
         for batch_index, batch in enumerate(train_loader):
             if self.progress.n >= self.progress.total:
                 break
+            self.maybe_relax_microbatch()
             self.model.train()
             learning_rates = [group["lr"] for group in self.optim.param_groups]
             logging_out = self.task.train_step(
@@ -414,6 +474,7 @@ class Runner:
                 self.scheduler,
                 self.device,
                 self.cfg.grad_clip,
+                self.cfg.get("microbatch_size"),
             )
             self.completed_steps += 1
             if (

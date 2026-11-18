@@ -40,12 +40,43 @@ class BaseTask:
         scheduler,
         device,
         grad_clip=None,
+        microbatch_size: int | None = None,
     ):
-        loss, logging_out = criterion(model, batch, device)
-        if loss.ndim != 0 or not torch.isfinite(loss):
-            raise ValueError("Expected a finite scalar training loss.")
+        """Apply one optimizer update to a full collated batch.
+
+        Parameters
+        ----------
+        batch : dict
+            Collated model inputs and targets, with leading batch axis B.
+        model, criterion : torch.nn.Module
+            Reconstruction model and task-specific scalar objective.
+        optimizer, scheduler : object
+            Stateful optimizer and schedule advanced exactly once per batch.
+        device : object
+            Device hosting the primary model replica.
+        grad_clip : float or None, optional
+            Gradient norm limit after all backward passes, default None.
+        microbatch_size : int or None, optional
+            Maximum forward-pass rows for accumulated gradients. The
+            optimizer batch retains B rows. Default None uses one forward.
+
+        Returns
+        -------
+        dict
+            Full-batch scalar metrics and pooled monitoring statistics.
+        """
         optimizer.zero_grad()
-        loss.backward()
+        if microbatch_size is None:
+            loss, logging_out = criterion(model, batch, device)
+            if loss.ndim != 0 or not torch.isfinite(loss):
+                raise ValueError("Expected a finite scalar training loss.")
+            loss.backward()
+        else:
+            if not hasattr(criterion, "accumulated_backward"):
+                raise ValueError("Criterion does not support accumulation.")
+            logging_out = criterion.accumulated_backward(
+                model, batch, device, microbatch_size,
+            )
         max_norm = float("inf") if not grad_clip else grad_clip
         if max_norm <= 0:
             raise ValueError("grad_clip must be nonnegative or None.")
@@ -54,7 +85,7 @@ class BaseTask:
         )
         optimizer.step()
         optimizer.zero_grad()
-        scheduler.step(loss.detach().item())
+        scheduler.step(logging_out["loss"])
 
         logging_out["grad_norm"] = grad_norm.item()
         return logging_out

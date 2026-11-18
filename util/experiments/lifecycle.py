@@ -46,6 +46,8 @@ OPERATIONAL_RUNNER = {
     "reports",
     "device",
     "multi_gpu",
+    "microbatch_size",
+    "adaptive_microbatch",
     "num_workers",
     "output_tb",
     "artifact_dir",
