@@ -286,9 +286,10 @@ def repair(
                 })
                 return
             replacements = fixed_options.pop("test_replacements")
-            if set(replacements) != {"zero", "random"}:
+            if (not replacements or len(set(replacements)) != len(replacements)
+                    or set(replacements) - {"zero", "random"}):
                 raise ValueError(
-                    "Fixed test diagnostics require zero and random policies."
+                    "Expected distinct zero/random fixed-test replacement policies."
                 )
             for replacement in replacements:
                 def policy_progress(done, total, stage):

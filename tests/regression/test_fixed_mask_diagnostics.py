@@ -254,8 +254,7 @@ def test_random_donors_independent_of_mask_positions(duration):
     )
     assert torch.equal(target, original)
     assert torch.equal(masked[~temporal], target[~temporal])
-    # Chance self-donors remain permitted, as in pre-training.
-    assert (masked[temporal] == target[temporal]).float().mean() < 0.15
+    assert not (masked[temporal] == target[temporal]).any()
     midpoint = windows // 2
     partitioned = torch.cat([
         fixed_replacement(
@@ -268,3 +267,13 @@ def test_random_donors_independent_of_mask_positions(duration):
         target, padding, temporal, spectral, "temporal", indices, 0, "zero",
     )
     assert torch.equal(zero, target.masked_fill(temporal, 0))
+
+
+def test_random_donor_rejects_identical_candidates():
+    """Impossible corruption fails instead of recording unchanged inputs."""
+    from util.experiments.fixed_mask_diagnostics import distinct_random_donor
+
+    with pytest.raises(ValueError, match="all same-window"):
+        distinct_random_donor(
+            torch.ones(4, 3), torch.ones(3), torch.Generator().manual_seed(0),
+        )

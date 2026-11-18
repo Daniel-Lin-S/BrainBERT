@@ -25,7 +25,7 @@ import torch
 from criterions.pretrain_masked_criterion import CONTENT_THRESHOLD
 
 PARTIAL_SAVE_BATCHES = 16
-RANDOM_REPLACEMENT_REVISION = "independent_donor_streams"
+RANDOM_REPLACEMENT_REVISION = "verified_distinct_donors"
 LOSS_METRICS = ("l1", "content_l1", "total_loss")
 LOSS_LABELS = ("L1", "Content L1", "Total loss")
 BASELINE_LABELS = (
@@ -389,6 +389,37 @@ def donor_generator(seed: int, index: int, axis: str) -> torch.Generator:
     return torch.Generator().manual_seed(int.from_bytes(digest[:8], "little"))
 
 
+def distinct_random_donor(
+    candidates: torch.Tensor, original: torch.Tensor,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Sample a donor and reject unchanged regions before applying it.
+
+    Parameters
+    ----------
+    candidates : torch.Tensor
+        Same-window donor views, shape (N, *region_shape).
+    original : torch.Tensor
+        Unmodified target region, shape region_shape.
+    generator : torch.Generator
+        Independent CPU generator for deterministic candidate ordering.
+
+    Returns
+    -------
+    torch.Tensor
+        A donor region differing from the original. Raises ValueError when
+        every candidate is identical; such inputs cannot be random-masked.
+    """
+    for index in torch.randperm(len(candidates), generator=generator):
+        donor = candidates[int(index)]
+        if not torch.equal(donor, original):
+            return donor.clone()
+    raise ValueError(
+        "Random masking cannot change this region: all same-window "
+        "donors equal the original target."
+    )
+
+
 def fixed_replacement(
     target: torch.Tensor, padding: torch.Tensor,
     temporal: torch.Tensor, spectral: torch.Tensor, kind: str,
@@ -411,23 +442,29 @@ def fixed_replacement(
             generator = donor_generator(seed, index, "temporal")
             selected = temporal[row, :, 0].nonzero().flatten()
             width = len(selected)
-            donor = int(torch.randint(
-                length - width + 1, (1,), generator=generator,
-            ))
             result[row, selected] = (
-                target[row, donor:donor + width]
-                if replacement == "random" else 0
+                distinct_random_donor(
+                    target[row, :length].unfold(0, width, 1).movedim(-1, 1),
+                    target[row, selected], generator,
+                ) if replacement == "random" else 0
             )
         if kind in {"spectral", "joint"}:
             generator = donor_generator(seed, index, "spectral")
             column = int(spectral[row, 0].nonzero().item())
-            donor = int(torch.randint(
-                target.shape[2], (1,), generator=generator,
-            ))
             result[row, :length, column] = (
-                result[row, :length, donor].clone()
-                if replacement == "random" else 0
+                distinct_random_donor(
+                    result[row, :length].T,
+                    target[row, :length, column], generator,
+                ) if replacement == "random" else 0
             )
+        if replacement == "random":
+            mask = (temporal[row] if kind == "temporal" else spectral[row])
+            if kind == "joint":
+                mask = temporal[row] | spectral[row]
+            if torch.equal(result[row][mask], target[row][mask]):
+                raise ValueError(
+                    f"Random masking left window {index} unchanged."
+                )
     return result
 
 
