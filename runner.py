@@ -29,7 +29,9 @@ from schedulers import build_scheduler
 from util.experiments.monitoring import (
     Accumulator, TrainingMonitor, diagnostic_names, rank_positions,
 )
-from util.experiments.storage import atomic_write, write_json
+from util.experiments.storage import (
+    atomic_write, publish_training_completion, write_json,
+)
 
 STATUS_STEP_INTERVAL = 10
 
@@ -703,6 +705,13 @@ class Runner:
                 best_state = (copy.deepcopy(self.model), {"loss": initial})
                 self.save_checkpoints(best_val=True)
                 self.save_epoch_snapshot()
+            if self.cfg.get("artifact_dir") and (
+                self.completed_steps == self.cfg.total_steps
+                or self.stopped_early
+            ):
+                publish_training_completion(
+                    Path(self.exp_dir), self.cfg.total_steps,
+                )
             if self.pending_fixed_validation:
                 self.run_fixed_validation()
                 self.pending_fixed_validation = False
@@ -749,6 +758,13 @@ class Runner:
                 )
                 if self.cfg.checkpoint_step > 0:
                     self.save_checkpoints()
+                if self.cfg.get("artifact_dir") and (
+                    self.completed_steps == self.cfg.total_steps
+                    or self.stopped_early
+                ):
+                    publish_training_completion(
+                        Path(self.exp_dir), self.cfg.total_steps,
+                    )
                 self.run_fixed_validation()
                 self.pending_fixed_validation = False
                 if self.cfg.checkpoint_step > 0:

@@ -803,3 +803,33 @@ def test_portable_encoder_export(tmp_path):
     torch.save({"changed": True}, source)
     with pytest.raises(ValueError, match="different source"):
         export_model_checkpoint(source, destination)
+
+
+def test_training_readiness_precedes_diagnostics(tmp_path):
+    """Final selection is ready even when fixed validation is pending."""
+    from util.experiments.storage import publish_training_completion
+
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    torch.save({"completed_steps": 8}, checkpoints / "checkpoint_best.pth")
+    last = {"completed_steps": 10, "best_step": 8,
+            "pending_fixed_validation": True, "stopped_early": False}
+    torch.save(last, checkpoints / "checkpoint_last.pth")
+    publish_training_completion(checkpoints, 10)
+    marker = tmp_path / "training_complete.json"
+    assert marker.exists()
+    assert not (tmp_path / "complete.json").exists()
+    published = marker.read_bytes()
+    publish_training_completion(checkpoints, 10)
+    assert marker.read_bytes() == published
+
+    marker.unlink()
+    last["completed_steps"] = 9
+    torch.save(last, checkpoints / "checkpoint_last.pth")
+    with pytest.raises(ValueError, match="unfinished"):
+        publish_training_completion(checkpoints, 10)
+    assert not marker.exists()
+    last["stopped_early"] = True
+    torch.save(last, checkpoints / "checkpoint_last.pth")
+    publish_training_completion(checkpoints, 10)
+    assert marker.exists()

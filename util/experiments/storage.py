@@ -132,3 +132,55 @@ def export_model_checkpoint(source: Path, destination: Path) -> None:
             raise ValueError("Encoder export differs from selected weights.")
 
     atomic_write(destination, lambda path: torch.save(result, path), audit)
+
+
+def publish_training_completion(checkpoints: Path, total_steps: int) -> None:
+    """Publish final checkpoint readiness independently of test diagnostics.
+
+    Parameters
+    ----------
+    checkpoints : pathlib.Path
+        Fit checkpoint directory containing saved last and selected states.
+    total_steps : int
+        Configured optimiser-step ceiling. Early stopping is read from the
+        last checkpoint. An unfinished training run is rejected.
+
+    Notes
+    -----
+    Writes training_complete.json beside the checkpoint directory, with
+    final training progress and the selected checkpoint's checksum. It
+    does not assert that testing or report generation has completed.
+    """
+    import torch
+
+    checkpoints = Path(checkpoints).resolve()
+    last = torch.load(
+        checkpoints / "checkpoint_last.pth", map_location="cpu",
+        weights_only=False,
+    )
+    completed = int(last["completed_steps"])
+    stopped = bool(last.get("stopped_early", False))
+    if completed != total_steps and not stopped:
+        raise ValueError(
+            f"Training is unfinished: {completed}/{total_steps} steps."
+        )
+    best_path = checkpoints / "checkpoint_best.pth"
+    best = torch.load(best_path, map_location="cpu", weights_only=False)
+    selected = int(best["completed_steps"])
+    if selected != last["best_step"] or not 0 < selected <= completed:
+        raise ValueError("Selected checkpoint does not match final selection.")
+    record = {
+        "fit_id": checkpoints.parent.name,
+        "completed_steps": completed,
+        "total_steps": total_steps,
+        "stopped_early": stopped,
+        "selected_step": selected,
+        "checkpoint": "checkpoints/checkpoint_best.pth",
+        "checkpoint_sha256": file_digest(best_path),
+    }
+    destination = checkpoints.parent / "training_complete.json"
+    if destination.exists():
+        if json.loads(destination.read_text()) != record:
+            raise ValueError("Published final checkpoint selection differs.")
+        return
+    write_json(destination, record)
