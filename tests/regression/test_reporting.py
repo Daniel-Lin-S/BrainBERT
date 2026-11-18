@@ -332,3 +332,38 @@ def test_named_evaluations_keep_separate_monitors(tmp_path):
         assert observed[0][1] != observed[1][1]
     finally:
         monitor.close()
+
+
+def test_parent_history_cutoff_and_current_test_isolation(tmp_path):
+    """Continuation retains ancestors only through the restored checkpoint."""
+    import json
+    import torch
+    from util.experiments.storage import file_digest
+
+    parent, child = tmp_path / "parent", tmp_path / "child"
+    for fit, steps in [(parent, [1, 10, 20]), (child, [11, 20])]:
+        (fit / "monitoring").mkdir(parents=True)
+        rows = [
+            {"phase": phase, "step": step, "interval_start": step,
+             "original_loss": float(step), "prediction_std": .5,
+             "target_std": 1.}
+            for phase in ["train", "validation", "test"] for step in steps
+        ]
+        pd.DataFrame(rows).to_csv(fit / "monitoring/metrics.csv", index=False)
+    checkpoint = parent / "checkpoints/last.pth"
+    checkpoint.parent.mkdir()
+    torch.save({"completed_steps": 10}, checkpoint)
+    provenance = {"invocation": {"exp": {"runner": {
+        "parent_checkpoint": str(checkpoint),
+        "parent_checkpoint_sha256": file_digest(checkpoint),
+    }}}}
+    (child / "provenance.json").write_text(json.dumps(provenance))
+    rows = load_history(child)["metrics"]
+    assert rows.query("phase == 'train'").step.tolist() == [1, 10, 11, 20]
+    assert rows.query("phase == 'validation'").step.tolist() == [1, 10, 11, 20]
+    assert rows.query("phase == 'test'").step.tolist() == [11, 20]
+    assert not rows.duplicated(["phase", "step"]).any()
+    assert load_history(child, include_parent=False)["metrics"].step.min() == 11
+    torch.save({"completed_steps": 20}, checkpoint)
+    with pytest.raises(ValueError, match="checksum"):
+        load_history(child)

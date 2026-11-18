@@ -1,7 +1,9 @@
 """Render immutable fit monitors into campaign PNG figures and CSV tables.
 
 Invoke with --artifact-root and --campaign. Input fit references resolve to
-scientific.json and root/resume-segment monitor tables. Outputs are grouped
+scientific.json, checkpoint ancestry and root/resume-segment monitor tables.
+Ancestor training and validation are included through the restored step;
+ancestor test results are excluded. Outputs are grouped
 by split and diagnostic under campaigns/<campaign>/reports/{figures,tables}.
 output_index.csv records each product's fit, checkpoint, state and meaning.
 No model fitting, feature extraction, or TensorBoard writes occur here.
@@ -32,6 +34,9 @@ from .monitoring import ACTIONS, STRATEGIES, SUM_FIELDS
 DPI = 300
 LEGEND_FONT_SIZE = 20
 EPOCH_FONT_SIZE = 16
+DENSE_EPOCH_FONT_SIZE = 12
+DENSE_EPOCH_THRESHOLD = 10
+EPOCH_LABEL_HEADROOM = 0.3
 TITLE_FONT_SIZE = 22
 LABEL_FONT_SIZE = 20
 TICK_FONT_SIZE = 18
@@ -133,8 +138,24 @@ def read_table(path: Path) -> pd.DataFrame:
     return frame
 
 
-def load_history(fit: Path) -> dict[str, pd.DataFrame]:
-    """Merge invocation tables, dropping overwritten unsaved trajectories."""
+def load_history(
+    fit: Path, include_parent: bool = True, ancestry: tuple = (),
+) -> dict[str, pd.DataFrame]:
+    """Merge restored ancestry and invocation tables at absolute steps.
+
+    Parameters
+    ----------
+    fit : Path
+        Managed fit directory containing immutable provenance and monitors.
+    include_parent : bool, optional
+        Include ancestor training/validation through the restored checkpoint,
+        default True. Test results always belong to the current fit only.
+    ancestry : tuple, optional
+        Ancestor paths used internally to reject cycles, default empty.
+    """
+    fit = fit.resolve()
+    if fit in ancestry:
+        raise ValueError(f"Cyclic checkpoint ancestry at {fit}.")
     root = fit / "monitoring"
     roots = [root] + sorted((root / "segments").glob("*"))
     history = {}
@@ -160,6 +181,8 @@ def load_history(fit: Path) -> dict[str, pd.DataFrame]:
             )
     if "metrics" not in history:
         raise ValueError(f"No monitor history in {fit}")
+    if include_parent:
+        history = merge_parent_history(fit, history, (*ancestry, fit))
     overall = history["metrics"]
     if overall.duplicated(["phase", "step"]).any():
         raise ValueError("Conflicting duplicate phase/step monitor rows.")
@@ -186,6 +209,48 @@ def load_history(fit: Path) -> dict[str, pd.DataFrame]:
                 raise ValueError(f"Frequency counts disagree at {phase} {step}")
     return history
 
+
+
+def merge_parent_history(fit: Path, history: dict, ancestry: tuple) -> dict:
+    """Prepend checkpoint-bounded ancestor monitors without ancestor tests."""
+    provenance = fit / "provenance.json"
+    if not provenance.exists():
+        return history
+    runner = json.loads(provenance.read_text())["invocation"]["exp"]["runner"]
+    source = runner.get("parent_checkpoint")
+    if not source:
+        return history
+    checkpoint = Path(source).resolve()
+    expected = runner.get("parent_checkpoint_sha256")
+    if not expected or file_digest(checkpoint) != expected:
+        raise ValueError("Parent checkpoint checksum differs from provenance.")
+    import torch
+
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    cutoff = int(state["completed_steps"])
+    del state
+    parent = checkpoint.parent.parent
+    previous = load_history(parent, ancestry=ancestry)
+    for name, frame in previous.items():
+        if name.startswith("test_"):
+            continue
+        frame = frame[frame.step <= cutoff].copy()
+        if "phase" in frame:
+            frame = frame[frame.phase != "test"]
+        if frame.empty:
+            continue
+        if "source_fit_id" not in frame:
+            frame["source_fit_id"] = parent.name
+        current = history.get(name)
+        if current is not None:
+            current = current.copy()
+            current["source_fit_id"] = fit.name
+            keys = ["phase", "step"] if "phase" in frame else ["step"]
+            replaced = pd.MultiIndex.from_frame(current[keys])
+            frame = frame[~pd.MultiIndex.from_frame(frame[keys]).isin(replaced)]
+            frame = pd.concat([frame, current], ignore_index=True)
+        history[name] = frame.sort_values("step", kind="stable")
+    return history
 
 def verify_fit(fit: Path) -> None:
     """Check all immutable completion artifacts without loading a model."""
@@ -352,6 +417,13 @@ class Report:
         has_epochs = any(
             getattr(ax, "_report_epochs", False) for ax in fig.axes
         )
+        if len(self.epochs) > DENSE_EPOCH_THRESHOLD:
+            for ax in fig.axes:
+                if getattr(ax, "_report_epochs", False):
+                    lower, upper = ax.get_ylim()
+                    ax.set_ylim(
+                        lower, upper + (upper - lower) * EPOCH_LABEL_HEADROOM,
+                    )
         has_legends = any(ax.get_legend_handles_labels()[1] for ax in fig.axes)
         fig.tight_layout(
             rect=(
@@ -409,7 +481,14 @@ class Report:
                 step,
                 0.98,
                 f"E{epoch}",
-                fontsize=EPOCH_FONT_SIZE,
+                rotation=(
+                    90 if len(self.epochs) > DENSE_EPOCH_THRESHOLD else 0
+                ),
+                fontsize=(
+                    DENSE_EPOCH_FONT_SIZE
+                    if len(self.epochs) > DENSE_EPOCH_THRESHOLD
+                    else EPOCH_FONT_SIZE
+                ),
                 transform=ax.get_xaxis_transform(),
                 ha="center",
                 va="top",
@@ -1059,7 +1138,9 @@ def render(
         path = root / "tables/test" / relative
         if path.exists():
             history[name] = read_table(path)
-    validation = history["metrics"].query("phase == 'validation'")
+    validation = load_history(fit, include_parent=False)["metrics"].query(
+        "phase == 'validation'"
+    )
     best = int(validation.loc[validation.original_loss.idxmin(), "step"])
     cfg = json.loads((fit / "scientific.json").read_text())
     budget = cfg["task"].get("sampling", {}).get("sample_budget")
@@ -1069,10 +1150,8 @@ def render(
         if budget
         else total
     )
-    if "epoch_metrics" in history:
-        epoch_steps = sorted(history["epoch_metrics"].step.unique().tolist())
-    else:
-        epoch_steps = list(range(per_epoch, total + 1, per_epoch))
+    observed = int(history["metrics"].step.max())
+    epoch_steps = list(range(per_epoch, min(total, observed) + 1, per_epoch))
     named_tests = list(
         (fit / "monitoring").rglob("test_evaluations/*/monitoring/metrics.csv")
     )
