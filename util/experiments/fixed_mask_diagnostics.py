@@ -687,7 +687,8 @@ def plot_fixed(
     durations = [d for d in expected if all(
         name in outputs for name in ("spectral", f"temporal_{d}", f"joint_{d}")
     )]
-    root = reports.parent / "diagnostics/fixed_masks"
+    root = (reports.parent / "diagnostics/fixed_masks"
+            / report.fixed_replacement)
     interpolation_path = root / "interpolation_metrics.json"
     if not interpolation_path.exists():
         interpolation_path = root / "interpolation.json"
