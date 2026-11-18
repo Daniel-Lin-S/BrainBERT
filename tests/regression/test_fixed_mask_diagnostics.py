@@ -231,3 +231,40 @@ def test_training_content_counts_only_selected_cells(tmp_path, monkeypatch):
     assert result["content_count"] == [4, 0]
     assert result["windows"] == 4
     assert not result["historical_masks"]
+
+
+@pytest.mark.parametrize("duration", [4, 8, 14])
+def test_random_donors_independent_of_mask_positions(duration):
+    """The maximum-duration gap must not systematically copy itself."""
+    from util.experiments.fixed_mask_diagnostics import fixed_replacement
+
+    windows, frames, frequencies = 128, 40, 4
+    target = torch.arange(windows * frames * frequencies).reshape(
+        windows, frames, frequencies,
+    ).float()
+    padding = torch.zeros(windows, frames, dtype=torch.bool)
+    indices = torch.arange(windows)
+    bins = balanced_bins(windows, frequencies, 0)
+    temporal, spectral = fixed_masks(
+        padding, frequencies, indices, duration, 14, bins, 0,
+    )
+    original = target.clone()
+    masked = fixed_replacement(
+        target, padding, temporal, spectral, "temporal", indices, 0, "random",
+    )
+    assert torch.equal(target, original)
+    assert torch.equal(masked[~temporal], target[~temporal])
+    # Chance self-donors remain permitted, as in pre-training.
+    assert (masked[temporal] == target[temporal]).float().mean() < 0.15
+    midpoint = windows // 2
+    partitioned = torch.cat([
+        fixed_replacement(
+            target[part], padding[part], temporal[part], spectral[part],
+            "temporal", indices[part], 0, "random",
+        ) for part in [slice(None, midpoint), slice(midpoint, None)]
+    ])
+    assert torch.equal(masked, partitioned)
+    zero = fixed_replacement(
+        target, padding, temporal, spectral, "temporal", indices, 0, "zero",
+    )
+    assert torch.equal(zero, target.masked_fill(temporal, 0))

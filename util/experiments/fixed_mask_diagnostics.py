@@ -14,6 +14,7 @@ or prediction tensors are persisted; completed scientific results and the
 training/validation mask generators are never modified.
 """
 
+import hashlib
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -24,6 +25,7 @@ import torch
 from criterions.pretrain_masked_criterion import CONTENT_THRESHOLD
 
 PARTIAL_SAVE_BATCHES = 16
+RANDOM_REPLACEMENT_REVISION = "independent_donor_streams"
 LOSS_METRICS = ("l1", "content_l1", "total_loss")
 LOSS_LABELS = ("L1", "Content L1", "Total loss")
 BASELINE_LABELS = (
@@ -245,6 +247,8 @@ def evaluate_fixed(
             f"Expected {options['batches']} test batches, got {test_batches}."
         )
     identity = {**identity, "configuration": dict(options)}
+    if options["replacement"] == "random":
+        identity["random_replacement_revision"] = RANDOM_REPLACEMENT_REVISION
     baseline_path = root / "training_baseline.json"
     if baseline_path.exists() and smoke_batches is None:
         baseline = json.loads(baseline_path.read_text())
@@ -368,6 +372,23 @@ def training_baseline(
     }
 
 
+def donor_generator(seed: int, index: int, axis: str) -> torch.Generator:
+    """Derive a deterministic donor stream independent of mask placement.
+
+    Parameters
+    ----------
+    seed : int
+        Benchmark seed shared by all compared models.
+    index : int
+        Stable window position, independent of batching and device assignment.
+    axis : str
+        Temporal or spectral donor stream identifier.
+    """
+    payload = f"{RANDOM_REPLACEMENT_REVISION}:{seed}:{index}:{axis}"
+    digest = hashlib.sha256(payload.encode()).digest()
+    return torch.Generator().manual_seed(int.from_bytes(digest[:8], "little"))
+
+
 def fixed_replacement(
     target: torch.Tensor, padding: torch.Tensor,
     temporal: torch.Tensor, spectral: torch.Tensor, kind: str,
@@ -376,6 +397,7 @@ def fixed_replacement(
     """Apply pre-training replacement semantics to fixed-size masks.
 
     Targets and masks have shape (B, T, F); padding has shape (B, T).
+    Donor streams are independent of mask placement and of each other.
     Random donors are drawn reproducibly within the same window. Temporal
     writes precede spectral writes, matching pre-training overlap handling.
     Returns a masked copy with shape (B, T, F).
@@ -385,8 +407,8 @@ def fixed_replacement(
     result = target.clone()
     for row, index in enumerate(indices.tolist()):
         length = int((~padding[row]).sum())
-        generator = torch.Generator().manual_seed(seed + index)
         if kind in {"temporal", "joint"}:
+            generator = donor_generator(seed, index, "temporal")
             selected = temporal[row, :, 0].nonzero().flatten()
             width = len(selected)
             donor = int(torch.randint(
@@ -397,6 +419,7 @@ def fixed_replacement(
                 if replacement == "random" else 0
             )
         if kind in {"spectral", "joint"}:
+            generator = donor_generator(seed, index, "spectral")
             column = int(spectral[row, 0].nonzero().item())
             donor = int(torch.randint(
                 target.shape[2], (1,), generator=generator,
@@ -659,6 +682,15 @@ def plot_fixed(
     import pandas as pd
     from .reporting import Report
 
+    for saved in outputs.values():
+        identity = saved["identity"]
+        if (identity["configuration"]["replacement"] == "random"
+                and identity.get("random_replacement_revision")
+                != RANDOM_REPLACEMENT_REVISION):
+            raise ValueError(
+                "Random-mask diagnostics use coupled donor seeds; "
+                "reevaluate with independent donor streams before plotting."
+            )
     alpha = json.loads((fit / "scientific.json").read_text())["criterion"][
         "alpha"
     ]
