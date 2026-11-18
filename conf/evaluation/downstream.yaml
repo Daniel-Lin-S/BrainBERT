@@ -1,0 +1,7 @@
+max_windows: 400
+block_size: 20
+prediction_batch_size: 8
+limited_tasks:
+  - rms_regression
+  - finger_regression
+  - stanford_fingerflex_regression
