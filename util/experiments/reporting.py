@@ -37,6 +37,8 @@ EPOCH_FONT_SIZE = 16
 DENSE_EPOCH_FONT_SIZE = 12
 DENSE_EPOCH_THRESHOLD = 10
 EPOCH_LABEL_HEADROOM = 0.3
+EPOCH_LEGEND_COLUMNS = 5
+EPOCH_LINE_STYLES = ("-", "--", "-.", ":")
 TITLE_FONT_SIZE = 22
 LABEL_FONT_SIZE = 20
 TICK_FONT_SIZE = 18
@@ -536,7 +538,7 @@ def shared_legends(fig: object) -> None:
             bbox_to_anchor=((left + right) / 2, top + 0.01),
             frameon=False,
             fontsize=LEGEND_FONT_SIZE,
-            ncol=min(len(entries), 3),
+            ncol=min(len(entries), getattr(fig, "_legend_columns", 3)),
         )
 
 
@@ -779,6 +781,61 @@ def condition_figures(report: Report, history: dict) -> None:
                 )
 
 
+def frequency_evolution(report: Report, frame: pd.DataFrame) -> None:
+    """Plot saved epoch-end frequency profiles with a shared epoch legend.
+
+    Parameters
+    ----------
+    report : Report
+        Output destination and absolute completed-epoch step boundaries.
+    frame : pandas.DataFrame
+        Validation rows containing step, strategy, frequency_hz,
+        relative_l1 and relative_content_l1 columns. Only the overall
+        strategy at exact epoch boundaries is plotted; no interpolation
+        between checkpoints is performed.
+    """
+    overall = frame[frame.strategy == "all"]
+    epochs = [
+        (epoch, step)
+        for epoch, step in enumerate(report.epochs, 1)
+        if step in set(overall.step)
+    ]
+    if not epochs:
+        raise ValueError("No completed-epoch frequency diagnostics available.")
+    missing = set(report.epochs) - set(overall.step)
+    if missing:
+        warnings.warn(
+            f"Missing frequency diagnostics at epoch-end steps: "
+            f"{sorted(missing)}"
+        )
+    colors = sns.color_palette("viridis", n_colors=len(report.epochs))
+    fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
+    fig._legend_columns = EPOCH_LEGEND_COLUMNS
+    for ax, key in zip(axes, ("relative_l1", "relative_content_l1")):
+        for epoch, step in epochs:
+            rows = overall[overall.step == step].sort_values("frequency_hz")
+            if not np.isfinite(rows[["frequency_hz", key]]).all().all():
+                plt.close(fig)
+                raise ValueError(
+                    f"Nonfinite {key} frequency profile at epoch {epoch}."
+                )
+            ax.plot(
+                rows.frequency_hz, rows[key], color=colors[epoch - 1],
+                linestyle=EPOCH_LINE_STYLES[
+                    ((epoch - 1) // EPOCH_LEGEND_COLUMNS)
+                    % len(EPOCH_LINE_STYLES)
+                ],
+                linewidth=2, label=f"Epoch {epoch}",
+            )
+        ax.set_ylabel(LABELS[key])
+        ax.set_xlabel("Frequency (Hz)")
+    report.figure(
+        "validation/frequency/evolution", fig,
+        "Validation frequency profiles across completed epochs; "
+        "loss normalised by frequency-specific constant prediction L1",
+    )
+
+
 def frequency_figures(
     report: Report,
     history: dict,
@@ -810,29 +867,7 @@ def frequency_figures(
         if not report.wants("figures", f"{phase}/frequency/reconstruction"):
             continue
         if phase == "validation":
-            fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-            for ax, key in zip(axes, ("relative_l1", "relative_content_l1")):
-                grid = frame[frame.strategy == "all"].pivot(
-                    index="frequency_hz",
-                    columns="step",
-                    values=key,
-                )
-                mesh = ax.pcolormesh(
-                    grid.columns,
-                    grid.index,
-                    grid.values,
-                    shading="nearest",
-                    cmap="viridis",
-                )
-                fig.colorbar(mesh, ax=ax, label=LABELS[key])
-                ax.set_ylabel("Frequency (Hz)")
-                report.step_axis(ax)
-            report.figure(
-                "validation/frequency/evolution",
-                fig,
-                "Validation relative reconstruction error; "
-                "checkpoint cells use actual step spacing",
-            )
+            frequency_evolution(report, frame)
         snapshot = frame[frame.step == report.best]
         if snapshot.empty:
             raise ValueError(
