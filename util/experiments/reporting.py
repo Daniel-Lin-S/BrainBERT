@@ -537,11 +537,16 @@ def shared_legends(fig: object) -> None:
             group["axes"].append(ax)
         else:
             groups.append({"entries": entries, "axes": [ax]})
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
     for group in groups:
         boxes = [ax.get_position() for ax in group["axes"]]
         left = min(box.x0 for box in boxes)
         right = max(box.x1 for box in boxes)
-        top = max(box.y1 for box in boxes)
+        top = max(
+            ax.get_tightbbox(renderer).y1 / fig.bbox.height
+            for ax in group["axes"]
+        )
         entries = group["entries"]
         fig.legend(
             entries.values(),
