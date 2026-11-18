@@ -146,7 +146,82 @@ def load_pinned_evaluation(path: Path, dataset: object) -> dict:
     return pinned
 
 
-def select_or_load(root: Path, dataset: object, settings: dict) -> dict:
+def nested_training_groups(dataset: object, parent: dict) -> dict:
+    """Validate a parent manifest and group its global training indices.
+
+    Parameters
+    ----------
+    dataset : object
+        Audited dataset with ordered records, cumulative ends and splits.
+    parent : dict
+        Frozen identity and train/validation/test global index lists.
+
+    Returns
+    -------
+    dict
+        Session positions mapped to unique local training indices.
+    """
+    from bisect import bisect_right
+
+    indices = parent["indices"]["train"]
+    budget = parent["identity"]["sampling"]["sample_budget"]
+    if len(indices) != budget or len(set(indices)) != budget:
+        raise ValueError("Nested training requires an exact unique budget.")
+    groups = {}
+    for index in indices:
+        if type(index) is not int or not 0 <= index < dataset.ends[-1]:
+            raise ValueError("Nested training index is outside eligibility.")
+        position = bisect_right(dataset.ends, index)
+        record = dataset.records[position]
+        if dataset.group_id(record) not in dataset.partitions["train"]:
+            raise ValueError("Nested training index is outside train split.")
+        offset = dataset.ends[position - 1] if position else 0
+        groups.setdefault(position, set()).add(index - offset)
+    return groups
+
+
+def extend_group(
+    eligible: int, quota: int, retained: set[int], cached: set[int],
+    rng: np.random.Generator,
+) -> list[int]:
+    """Retain parent windows and fill from cached, then fresh windows.
+
+    Parameters
+    ----------
+    eligible : int
+        Number of eligible local windows.
+    quota : int
+        Target unique window count, no smaller than the parent count.
+    retained, cached : set[int]
+        Parent membership and compatible cache membership, respectively.
+    rng : numpy.random.Generator
+        Seeded generator used for additional draws.
+
+    Returns
+    -------
+    list[int]
+        Unique local indices of length quota containing all parent windows.
+    """
+    if not len(retained) <= quota <= eligible:
+        raise ValueError(
+            f"Nested quota must be between {len(retained)} and "
+            f"{eligible}, got {quota}."
+        )
+    remaining = np.setdiff1d(
+        np.arange(eligible), sorted(retained), assume_unique=True
+    )
+    cached_remaining = cached - retained
+    mapped = set(np.searchsorted(remaining, sorted(cached_remaining)))
+    added = select_group(
+        len(remaining), quota - len(retained), mapped, rng, False
+    ) if quota > len(retained) else []
+    return sorted(retained) + remaining[added].tolist()
+
+
+def select_or_load(
+    root: Path, dataset: object, settings: dict,
+    parent: dict | None = None,
+) -> dict:
     """Freeze cache-aware indices across models and cache growth.
 
     Parameters
@@ -157,6 +232,8 @@ def select_or_load(root: Path, dataset: object, settings: dict) -> dict:
         Dataset exposing subgroup records, partitions, and cache membership.
     settings : dict
         Scientific sampling budget, alpha, seed, and evaluation batch counts.
+    parent : dict, optional
+        Compatible smaller frozen selection to retain, default None.
 
     Returns
     -------
@@ -171,27 +248,54 @@ def select_or_load(root: Path, dataset: object, settings: dict) -> dict:
         "sampling": settings,
         "preprocessor": dataset.cache_settings(),
     }
+    if parent is not None:
+        previous = parent["identity"]
+        expected = {**identity, "sampling": {
+            **settings,
+            "sample_budget": previous["sampling"]["sample_budget"],
+        }}
+        if previous != expected:
+            raise ValueError("Nested parent source or sampling differs.")
+        if settings["sample_budget"] <= previous["sampling"]["sample_budget"]:
+            raise ValueError("Nested budget must exceed the parent budget.")
+        nested_training_groups(dataset, parent)
     path = selection_path(root, dataset.selection_namespace, identity)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         return _select_or_load_unlocked(
-            path, dataset, settings, identity
+            path, dataset, settings, identity, parent
         )
 
 
 def _select_or_load_unlocked(
-    path: Path, dataset: object, settings: dict, identity: dict
+    path: Path, dataset: object, settings: dict, identity: dict,
+    parent: dict | None = None,
 ) -> dict:
     """Read or write one selection while its manifest lock is held."""
     if path.exists():
         saved = json.loads(path.read_text())
         if saved["identity"] != identity:
             raise ValueError("Sampling selection manifest identity differs.")
+        if parent is not None:
+            nested_training_groups(dataset, saved)
+            if not set(parent["indices"]["train"]).issubset(
+                saved["indices"]["train"]
+            ):
+                raise ValueError("Existing selection omits parent windows.")
+            for phase in ("validation", "test"):
+                if saved["indices"][phase] != parent["indices"][phase]:
+                    raise ValueError("Existing evaluation differs from parent.")
         return saved
+    retained = (
+        nested_training_groups(dataset, parent) if parent is not None else {}
+    )
     rng = np.random.default_rng(settings["seed"])
     result = {}
     for phase in ("train", "validation", "test"):
+        if parent is not None and phase != "train":
+            result[phase] = list(parent["indices"][phase])
+            continue
         records = [
             (position, record)
             for position, record in enumerate(dataset.records)
@@ -209,7 +313,12 @@ def _select_or_load_unlocked(
         selected = []
         for (position, record), quota in zip(records, quotas):
             cached = dataset.cached_local_indices(record)
-            if phase == "train":
+            if parent is not None:
+                local = extend_group(
+                    record["eligible"], quota, retained.get(position, set()),
+                    cached, rng,
+                )
+            elif phase == "train":
                 local = select_group(
                     record["eligible"], quota, cached, rng, True
                 )
@@ -233,5 +342,7 @@ def _select_or_load_unlocked(
             rng.shuffle(selected)
         result[phase] = selected
     saved = {"identity": identity, "indices": result}
+    if parent is not None:
+        saved["parent_sha256"] = digest(parent)
     write_json(path, saved)
     return saved

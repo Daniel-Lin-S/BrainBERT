@@ -231,7 +231,13 @@ def prepare_selected(
     moments = {}
     if workers <= 0:
         raise ValueError("workers must be positive.")
-    tasks = [(dataset, session, sorted(indices))
+    worker_dataset = dataset
+    if workers > 1:
+        from copy import copy
+
+        worker_dataset = copy(dataset)
+        worker_dataset.selection = None
+    tasks = [(worker_dataset, session, sorted(indices))
              for session, indices in sorted(by_session.items())]
     if progress_callback is not None:
         progress_callback(0, len(tasks))
@@ -283,7 +289,11 @@ def main() -> None:
     parser.add_argument("--feature-cache", required=True, type=Path)
     parser.add_argument("--artifact-root", required=True, type=Path)
     parser.add_argument("--preprocessor", required=True, type=Path)
-    parser.add_argument("--sample-budget", type=int)
+    budgets = parser.add_mutually_exclusive_group()
+    budgets.add_argument("--sample-budget", type=int)
+    budgets.add_argument("--nested-budgets", type=int, nargs="+")
+    parser.add_argument("--parent-selection", type=Path)
+    parser.add_argument("--pin-only", action="store_true")
     parser.add_argument("--pinned-evaluation", type=Path)
     parser.add_argument(
         "--validation-batches", type=int,
@@ -312,7 +322,15 @@ def main() -> None:
         "audit": str(args.audit.resolve()),
     })
     dataset = AJILE12(data_cfg, preprocessor_cfg=preprocessor)
-    if args.sample_budget is None and args.pinned_evaluation is None:
+    if args.nested_budgets is not None:
+        if args.parent_selection is None:
+            raise ValueError("Nested budgets require --parent-selection.")
+        if args.nested_budgets != sorted(set(args.nested_budgets)):
+            raise ValueError("Nested budgets must be strictly increasing.")
+    elif args.parent_selection is not None:
+        raise ValueError("--parent-selection requires --nested-budgets.")
+    if (args.sample_budget is None and args.nested_budgets is None
+            and args.pinned_evaluation is None):
         raise ValueError(
             "Full-data preparation requires --pinned-evaluation."
         )
@@ -329,7 +347,27 @@ def main() -> None:
         load_pinned_evaluation(args.pinned_evaluation, dataset)
         if args.pinned_evaluation is not None else None
     )
-    if args.sample_budget is None:
+    if args.nested_budgets is not None:
+        import json
+        from util.experiments.sampling import selection_path
+
+        selected = json.loads(args.parent_selection.resolve().read_text())
+        if pinned is None:
+            raise ValueError("Nested preparation requires pinned evaluation.")
+        for phase in ("validation", "test"):
+            if selected["indices"][phase] != pinned["indices"][phase]:
+                raise ValueError(f"Parent {phase} differs from pin.")
+        for budget in args.nested_budgets:
+            selected = select_or_load(
+                args.artifact_root, dataset,
+                {**settings, "sample_budget": budget}, parent=selected,
+            )
+            path = selection_path(
+                args.artifact_root, dataset.selection_namespace,
+                selected["identity"],
+            ).resolve()
+            print(f"Pinned {budget} training windows: {path}", flush=True)
+    elif args.sample_budget is None:
         selected = {"indices": {"train": [], **pinned["indices"]}}
     else:
         selected = select_or_load(args.artifact_root, dataset, settings)
@@ -339,6 +377,8 @@ def main() -> None:
                     raise ValueError(
                         f"Selected {phase} windows differ from pin."
                     )
+    if args.pin_only:
+        return
     dataset.configure_selection(selected)
     if args.max_examples is not None:
         if args.max_examples <= 0:

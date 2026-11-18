@@ -1,9 +1,10 @@
 """Verify reusable group quotas, cache priority, and frozen membership."""
 
 import numpy as np
+import pytest
 
 from util.experiments.sampling import (
-    allocate, select_group, select_or_load
+    allocate, extend_group, select_group, select_or_load
 )
 
 
@@ -86,6 +87,41 @@ def test_selection_freezes_cache_snapshot(tmp_path) -> None:
         larger["indices"]["train"]
     )
 
+
+    nested = select_or_load(
+        tmp_path, dataset, {**settings, "sample_budget": 12}, parent=first
+    )
+    assert len(set(nested["indices"]["train"])) == 12
+    assert set(first["indices"]["train"]).issubset(
+        nested["indices"]["train"]
+    )
+    for phase in ("validation", "test"):
+        assert nested["indices"][phase] == first["indices"][phase]
+    dataset.cached["train"] = set(range(20))
+    assert select_or_load(
+        tmp_path, dataset, {**settings, "sample_budget": 12}, parent=first
+    ) == nested
+    with pytest.raises(ValueError, match="sampling differs"):
+        select_or_load(
+            tmp_path, dataset,
+            {**settings, "sample_budget": 14, "seed": 8}, parent=first,
+        )
+    with pytest.raises(ValueError, match="exceed the parent"):
+        select_or_load(tmp_path, dataset, settings, parent=first)
+
+
+def test_nested_group_retains_parent_and_prioritizes_cache() -> None:
+    """An unrelated cache cannot displace mandatory parent windows."""
+    retained = {1, 3}
+    cached = {4, 5, 6, 7}
+    selected = extend_group(
+        20, 5, retained, cached, np.random.default_rng(7)
+    )
+    assert len(set(selected)) == 5
+    assert retained.issubset(selected)
+    assert set(selected) - retained <= cached
+    with pytest.raises(ValueError, match="Nested quota"):
+        extend_group(20, 1, retained, cached, np.random.default_rng(7))
 
 
 def test_raw_cache_reuses_extraction(tmp_path) -> None:
