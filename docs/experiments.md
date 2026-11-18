@@ -116,3 +116,20 @@ profile adds epoch-wise validation diagnostics, with resumable condition sums
 and a frozen training-mean baseline. These shared-reference diagnostics do not
 select checkpoints or affect early stopping. Pending diagnostics and patience
 are restored with the latest checkpoint.
+
+
+## Downstream checkpoint evaluation
+
+Use `python -m util.experiments.downstream_evaluation` with the
+brain_decoding task YAML, `--checkout`, `--output-root`, and
+`--manifest-root`. Run it in the brain_decoding Python environment.
+This BrainBERT-specific entry point uses `conf/evaluation/downstream.yaml`:
+400 scored windows per split for RMS, finger regression, and Stanford finger
+flexion; all other tasks retain their full tests. `--full-test` explicitly
+selects full evaluation. Ordinary brain_decoding entry points remain full-set.
+
+Share one manifest root across checkpoints. Temporal blocks and their smoothing
+context are deterministic. Inference processes only selected windows and needed
+context, reusing configured raw STFT caches. Existing readouts are restored when
+the source configuration points to completed component fits; a separate output
+root preserves full-test results. Paired comparisons must use the same manifests.
