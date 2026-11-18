@@ -790,7 +790,8 @@ def frequency_evolution(report: Report, frame: pd.DataFrame) -> None:
         Output destination and absolute completed-epoch step boundaries.
     frame : pandas.DataFrame
         Validation rows containing step, strategy, frequency_hz,
-        relative_l1 and relative_content_l1 columns. Only the overall
+        l1, content_l1, relative_l1 and relative_content_l1 columns.
+        Only the overall
         strategy at exact epoch boundaries is plotted; no interpolation
         between checkpoints is performed.
     """
@@ -809,31 +810,41 @@ def frequency_evolution(report: Report, frame: pd.DataFrame) -> None:
             f"{sorted(missing)}"
         )
     colors = sns.color_palette("viridis", n_colors=len(report.epochs))
-    fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
-    fig._legend_columns = EPOCH_LEGEND_COLUMNS
-    for ax, key in zip(axes, ("relative_l1", "relative_content_l1")):
-        for epoch, step in epochs:
-            rows = overall[overall.step == step].sort_values("frequency_hz")
-            if not np.isfinite(rows[["frequency_hz", key]]).all().all():
-                plt.close(fig)
-                raise ValueError(
-                    f"Nonfinite {key} frequency profile at epoch {epoch}."
+    for suffix, keys, description in (
+        (
+            "", ("relative_l1", "relative_content_l1"),
+            "loss normalised by frequency-specific constant prediction L1",
+        ),
+        (
+            "_unnormalised", ("l1", "content_l1"),
+            "unnormalised reconstruction loss",
+        ),
+    ):
+        fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
+        fig._legend_columns = EPOCH_LEGEND_COLUMNS
+        for ax, key in zip(axes, keys):
+            for epoch, step in epochs:
+                rows = overall[overall.step == step].sort_values("frequency_hz")
+                if not np.isfinite(rows[["frequency_hz", key]]).all().all():
+                    plt.close(fig)
+                    raise ValueError(
+                        f"Nonfinite {key} frequency profile at epoch {epoch}."
+                    )
+                ax.plot(
+                    rows.frequency_hz, rows[key], color=colors[epoch - 1],
+                    linestyle=EPOCH_LINE_STYLES[
+                        ((epoch - 1) // EPOCH_LEGEND_COLUMNS)
+                        % len(EPOCH_LINE_STYLES)
+                    ],
+                    linewidth=2, label=f"Epoch {epoch}",
                 )
-            ax.plot(
-                rows.frequency_hz, rows[key], color=colors[epoch - 1],
-                linestyle=EPOCH_LINE_STYLES[
-                    ((epoch - 1) // EPOCH_LEGEND_COLUMNS)
-                    % len(EPOCH_LINE_STYLES)
-                ],
-                linewidth=2, label=f"Epoch {epoch}",
-            )
-        ax.set_ylabel(LABELS[key])
-        ax.set_xlabel("Frequency (Hz)")
-    report.figure(
-        "validation/frequency/evolution", fig,
-        "Validation frequency profiles across completed epochs; "
-        "loss normalised by frequency-specific constant prediction L1",
-    )
+            ax.set_ylabel(LABELS[key])
+            ax.set_xlabel("Frequency (Hz)")
+        report.figure(
+            f"validation/frequency/evolution{suffix}", fig,
+            "Validation frequency profiles across completed epochs; "
+            + description,
+        )
 
 
 def frequency_figures(
