@@ -704,6 +704,11 @@ def plot_fixed(
             and interpolation["criterion_alpha"] != alpha):
         raise ValueError("Interpolation criterion coefficient differs.")
     for normalised in (False, True):
+        if "spectral" in outputs:
+            plot_frequency_losses(
+                report, frequencies, None, frame_hop_ms, normalised,
+                None, alpha,
+            )
         for duration in durations:
             plot_frequency_losses(
                 report, frequencies, duration, frame_hop_ms, normalised,
@@ -715,17 +720,25 @@ def plot_fixed(
 
 
 def plot_frequency_losses(
-    report: Any, frame: Any, duration: int, hop_ms: float,
+    report: Any, frame: Any, duration: int | None, hop_ms: float,
     normalised: bool, interpolation: dict | None, alpha: float,
 ) -> None:
-    """Draw three losses across frequency for one paired mask duration."""
+    """Plot temporal/joint losses, or standalone spectral losses.
+
+    A duration of None selects the one-bin spectral condition and its
+    matched constant predictor; integer durations select temporal/joint
+    profiles. Raw and baseline-normalised versions share this renderer.
+    """
     import matplotlib.pyplot as plt
     import numpy as np
 
-    temporal = frame[frame.condition == f"temporal_{duration}"]
+    condition = "spectral" if duration is None else f"temporal_{duration}"
+    temporal = frame[frame.condition == condition]
+    kinds = ("spectral",) if duration is None else ("temporal", "joint")
     for metric, title in zip(LOSS_METRICS, LOSS_LABELS):
         fig, ax = plt.subplots(figsize=(13, 8))
-        for kind, (color, style) in MASK_STYLES.items():
+        for kind in kinds:
+            color, style = MASK_STYLES[kind]
             name = "spectral" if kind == "spectral" else f"{kind}_{duration}"
             subset = frame[frame.condition == name]
             label = "Joint intersection" if kind == "joint" else kind.title()
@@ -740,7 +753,8 @@ def plot_frequency_losses(
                 temporal.frequency_hz,
                 temporal[f"constant_prediction_{metric}"],
                 color="0.55", ls=":", lw=2.5,
-                label=f"{baseline_label}\n(temporal)",
+                label=(baseline_label if duration is None
+                       else f"{baseline_label}\n(temporal)"),
             )
             if interpolation is not None and (
                 metric == "l1" or "content_error_sums" in interpolation
@@ -763,9 +777,14 @@ def plot_frequency_losses(
             else f"{title} (normalised targets)"
         )
         suffix = "_normalised" if normalised else ""
+        name = "spectral" if duration is None else f"duration_{duration}"
+        setting = (
+            "one-bin spectral mask" if duration is None
+            else f"{duration} frames ({duration * hop_ms:.0f} ms)"
+        )
         report.figure(
-            f"test/fixed_masks/frequency/{metric}/duration_{duration}{suffix}",
-            fig, f"{title}: {duration} frames ({duration * hop_ms:.0f} ms); "
+            f"test/fixed_masks/frequency/{metric}/{name}{suffix}",
+            fig, f"{title}: {setting}; "
             f"validation-selected checkpoint {report.best}",
         )
 
@@ -784,9 +803,6 @@ def plot_duration_losses(
             color, style = MASK_STYLES[kind]
             ax.plot(subset.duration_ms, subset[column], color=color,
                     ls=style, marker="o", lw=2.5, label=kind.title())
-        ax.axhline(frame[frame["mask"] == "spectral"].iloc[0][column],
-                   color=MASK_STYLES["spectral"][0], ls="--", lw=2.5,
-                   label="Spectral")
         if normalised:
             ax.axhline(1, color="0.55", ls=":", label="Constant prediction")
         ticks = frame[frame["mask"] == "temporal"].sort_values("duration_ms")
