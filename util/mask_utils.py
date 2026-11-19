@@ -10,6 +10,7 @@ last write, not equality of input and target. A no-op preserves prior writes.
 import random
 import copy
 import math
+from functools import lru_cache
 
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Subset
@@ -17,6 +18,7 @@ from torch.utils.data import Subset
 import numpy as np
 import torch
 
+MASK_TEMPLATE_CACHE_SIZE = 16
 TEMPORAL = 1
 SPECTRAL = 2
 ZERO = 1
@@ -185,58 +187,35 @@ def fixed_mask_inputs(
     return masked_data, mask_label
 
 
+@lru_cache(maxsize=MASK_TEMPLATE_CACHE_SIZE)
+def temporal_mask_template(
+    min_f: float, max_f: float, bins: int, minimum: int,
+) -> tuple[int, torch.Tensor, torch.Tensor]:
+    """Build relative frame and bin indices for a single temporal mask.
+
+    Returns the largest half-width and two integer vectors of length N,
+    one entry per selected cell. Callers offset frames by the mask center.
+    """
+    frequencies = np.linspace(min_f, max_f, bins)
+    widths = [int(max(minimum, 200 / (25 + f))) for f in frequencies]
+    offsets = np.concatenate([np.arange(-w, w) for w in widths])
+    channels = np.repeat(np.arange(bins), np.multiply(2, widths))
+    return max(widths), torch.from_numpy(offsets), torch.from_numpy(channels)
+
+
 def variable_mask_time(
     data: torch.Tensor, task_cfg: object, return_provenance: bool = False
 ) -> tuple:
     min_size_in_samples = random.randint(1, 2)
 
-    fs = np.linspace(task_cfg.min_f, task_cfg.max_f, task_cfg.n_freq_steps)
-    window_sizes = [int(max(min_size_in_samples, 200 / (25 + f))) for f in fs]
-    # window_sizes = [int(max(0,160/(30+f))) for f in fs]
-
-    max_size = max(window_sizes)
-    valid_starts = list(
-        np.arange(max_size, data.shape[0] - max_size)
-    )  # remember that mask is centered on time position
-
-    def fill_in_time_mask(array, position, value=None, value_slice=None):
-        # value -- what value to fill the template with
-        assert not (value != None and value_slice != None)
-        arr_len = array.shape[0]
-        if value_slice is not None:
-            for i in range(len(window_sizes)):
-                array[
-                    max(0, position - window_sizes[i]) : min(
-                        arr_len, position + window_sizes[i]
-                    ),
-                    i,
-                ] = value_slice[i]
-        else:
-            for i in range(len(window_sizes)):
-                array[
-                    max(0, position - window_sizes[i]) : min(
-                        arr_len, position + window_sizes[i]
-                    ),
-                    i,
-                ] = value
-        return array
-
-    def take_time_mask(array, position):
-        arr_len = array.shape[0]
-        value_slice = []
-        for i in range(len(window_sizes)):
-            value_slice.append(
-                array[
-                    max(0, position - window_sizes[i]) : min(
-                        arr_len, position + window_sizes[i]
-                    ),
-                    i,
-                ]
-            )
-        return value_slice
+    max_size, offsets, channels = temporal_mask_template(
+        task_cfg.min_f, task_cfg.max_f, task_cfg.n_freq_steps,
+        min_size_in_samples,
+    )
+    valid_starts = range(max_size, data.shape[0] - max_size)
 
     masked_positions = []
-    max_window = 2 * max(window_sizes)
+    max_window = 2 * max_size
     mask_probability = task_cfg.mask_p
     for pos in valid_starts:
         if random.random() < mask_probability:
@@ -253,25 +232,17 @@ def variable_mask_time(
     mask_label = torch.zeros_like(data)
     action = torch.zeros_like(data, dtype=torch.uint8)
     for position in masked_positions:
+        rows = offsets + position
         dice = random.random()
-        if dice < identity:  # TODO look at attentions
-            pass
-        elif dice < random_end:
-            random_position = valid_starts[
-                random.randint(0, len(valid_starts) - 1)
-            ]
-            value_slice = take_time_mask(data, random_position)
-            masked_data = fill_in_time_mask(
-                masked_data, position, value_slice=value_slice
-            )
-            fill_in_time_mask(action, position, value=RANDOM)
-        else:
-            mask_fill_value = get_mask_fill_value(data)
-            masked_data = fill_in_time_mask(
-                masked_data, position, value=mask_fill_value
-            )
-            fill_in_time_mask(action, position, value=ZERO)
-        mask_label = fill_in_time_mask(mask_label, position, 1)
+        if dice >= identity:
+            if dice < random_end:
+                donor = valid_starts[random.randint(0, len(valid_starts) - 1)]
+                masked_data[rows, channels] = data[offsets + donor, channels]
+                action[rows, channels] = RANDOM
+            else:
+                masked_data[rows, channels] = get_mask_fill_value(data)
+                action[rows, channels] = ZERO
+        mask_label[rows, channels] = 1
     if return_provenance:
         return (
             masked_data,
