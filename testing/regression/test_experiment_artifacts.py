@@ -49,6 +49,34 @@ def test_reuse_across_campaigns_and_protect_corruption(tmp_path):
     assert checkpoint.read_bytes() == b"corrupt"
 
 
+@pytest.mark.parametrize("old_has_decay", [False, True])
+def test_reuse_legacy_scheduler_default(tmp_path, old_has_decay):
+    """Both recorded forms of the default reuse without changing artifacts."""
+    scheduler = {"name": "ramp_up", "warmup": 0.025}
+    if old_has_decay:
+        scheduler["decay"] = False
+    old = {"runner": {"scheduler": scheduler}}
+    args = [str(tmp_path / "artifacts"), str(tmp_path / "logs")]
+    with FitRun(*args, "first", old) as original:
+        complete_stub(original)
+        fit_id = original.fit_id
+        scientific_path = original.path / "scientific.json"
+        before = scientific_path.read_bytes()
+    other = {"runner": {"scheduler": dict(scheduler)}}
+    if old_has_decay:
+        del other["runner"]["scheduler"]["decay"]
+    else:
+        other["runner"]["scheduler"]["decay"] = False
+    with FitRun(*args, "second", other) as reused:
+        assert reused.reused
+        assert reused.fit_id == fit_id
+    assert scientific_path.read_bytes() == before
+    other["runner"]["scheduler"]["decay"] = True
+    with FitRun(*args, "third", other) as different:
+        assert not different.reused
+        assert different.fit_id != fit_id
+
+
 def test_lock_and_quarantine(tmp_path):
     args = [
         str(tmp_path / "artifacts"),
@@ -107,6 +135,45 @@ def test_scientific_identity_ignores_invocation(tmp_path):
     cfg.exp.runner.lr = 0.1
     cfg.exp.runner.log_step = 5
     assert digest(scientific_config(cfg, dataset, splits)) != before
+
+
+def test_identity_uses_resolved_scientific_values():
+    """Equivalent rate and duration configurations share a fit identity."""
+    from util.experiments.execution import resolve_training_steps
+
+    cfg = OmegaConf.create({
+        "exp": {
+            "base_lr": 1e-4,
+            "runner": {
+                "lr": None, "train_batch_size": 128,
+                "epochs": 2, "total_steps": None,
+                "scheduler": {"total_steps": "${exp.runner.total_steps}"},
+            },
+        },
+        "protocol": {"revision": "original"},
+        "data": {"name": "example"},
+        "model": {"hidden_dim": 8},
+        "task": {"mask_type": "fixed"},
+        "criterion": {"alpha": 8},
+        "preprocessor": {"name": "stft"},
+    })
+    dataset = SimpleNamespace(inventory=[])
+    task = SimpleNamespace(train_set=range(256))
+    resolve_training_steps(cfg, task)
+    automatic = scientific_config(cfg, dataset, {})
+    assert automatic["runner"]["lr"] == 5e-5
+    assert automatic["runner"]["total_steps"] == 4
+    assert "epochs" not in automatic["runner"]
+    identity = digest(automatic)
+
+    cfg.exp.base_lr = 0.003
+    cfg.exp.runner.lr = 5e-5
+    cfg.exp.runner.epochs = None
+    cfg.exp.runner.total_steps = 4
+    cfg.model.hidden_dim = "${criterion.alpha}"
+    assert digest(scientific_config(cfg, dataset, {})) == identity
+    cfg.exp.runner.lr = 1e-4
+    assert digest(scientific_config(cfg, dataset, {})) != identity
 
 
 def test_cache_content_identity_and_corruption(tmp_path):

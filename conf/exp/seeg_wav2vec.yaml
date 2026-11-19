@@ -1,5 +1,6 @@
+base_lr: 0.0016
 runner:
-    lr: 1e-4
+    lr: null
     optim: Adam
     train_batch_size: 16
     valid_batch_size: 128

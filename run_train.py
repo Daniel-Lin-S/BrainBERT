@@ -11,6 +11,9 @@ from omegaconf import DictConfig
 @hydra.main(version_base=None, config_path="conf", config_name=None)
 def main(cfg: DictConfig) -> None:
     """Dispatch a resolved configuration to the shared training workflow."""
+    from util.experiments.lifecycle import resolve_batch_scaled_lr
+
+    resolve_batch_scaled_lr(cfg)
     if "storage" in cfg:
         from util.experiments.execution import execute
 

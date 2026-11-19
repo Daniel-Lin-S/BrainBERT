@@ -5,6 +5,82 @@ import pytest
 from omegaconf import OmegaConf
 
 
+@pytest.mark.parametrize("name, batch, rate", [
+    ("spec2vec", 256, 1e-4),
+    ("ajile12", 256, 1e-4),
+    ("ajile12_followup", 256, 1e-4),
+    ("seeg_wav2vec", 16, 1e-4),
+])
+def test_experiment_rates_preserve_defaults_and_scale(name, batch, rate):
+    """Check composed experiment defaults, scaling, and explicit rates."""
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    from util.experiments.lifecycle import resolve_batch_scaled_lr
+
+    config_dir = Path(__file__).resolve().parents[2] / "conf"
+    with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
+        for overrides, expected in (
+            ([], rate),
+            ([f"exp.runner.train_batch_size={batch * 2}"], rate * 2),
+            ([f"exp.runner.train_batch_size={batch * 2}",
+              "exp.runner.lr=0.003"], 0.003),
+        ):
+            cfg = compose(overrides=[f"+exp={name}", *overrides])
+            resolve_batch_scaled_lr(cfg)
+            assert cfg.exp.runner.lr == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("name", ["finetune", "feature_extract"])
+def test_downstream_rate_does_not_scale(name):
+    """Downstream configurations retain their independent learning rate."""
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    from util.experiments.lifecycle import resolve_batch_scaled_lr
+
+    config_dir = Path(__file__).resolve().parents[2] / "conf"
+    with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
+        cfg = compose(overrides=[
+            f"+exp={name}", "exp.runner.train_batch_size=128",
+        ])
+        resolve_batch_scaled_lr(cfg)
+        assert cfg.exp.runner.lr == pytest.approx(1e-3)
+
+
+@pytest.mark.parametrize("batch, expected", [
+    (128, 5e-5), (256, 1e-4), (512, 2e-4),
+])
+def test_pretraining_rate_scales_optimizer_batch(batch, expected):
+    """Scale the optimizer batch and preserve explicit overrides."""
+    from util.experiments.lifecycle import resolve_batch_scaled_lr
+
+    cfg = OmegaConf.create({"exp": {
+        "base_lr": 1e-4,
+        "runner": {
+            "lr": None, "train_batch_size": batch, "microbatch_size": 32,
+        },
+    }})
+    resolve_batch_scaled_lr(cfg)
+    assert cfg.exp.runner.lr == pytest.approx(expected)
+    cfg.exp.runner.lr = 0.003
+    resolve_batch_scaled_lr(cfg)
+    assert cfg.exp.runner.lr == 0.003
+
+
+def test_pretraining_rate_rejects_invalid_batch():
+    """Invalid optimizer batches must not produce a learning rate."""
+    from util.experiments.lifecycle import resolve_batch_scaled_lr
+
+    cfg = OmegaConf.create({"exp": {
+        "base_lr": 1e-4, "runner": {"lr": None, "train_batch_size": 0},
+    }})
+    with pytest.raises(ValueError, match="train_batch_size"):
+        resolve_batch_scaled_lr(cfg)
+
+
 def test_budget_and_epoch_duration_are_independent(tmp_path, monkeypatch):
     """Resolve either run length after freezing AJILE membership."""
     import json

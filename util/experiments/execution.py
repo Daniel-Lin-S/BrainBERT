@@ -207,6 +207,9 @@ def execute(cfg: object) -> dict:
     import tasks
     from runner import Runner
     from .monitoring import diagnostic_names
+    from .lifecycle import resolve_batch_scaled_lr
+
+    resolve_batch_scaled_lr(cfg)
 
     reports_requested(cfg.exp.runner.get("reports"))
     selected_diagnostics = diagnostic_names(

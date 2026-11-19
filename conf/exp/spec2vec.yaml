@@ -1,9 +1,10 @@
 defaults:
   - /evaluation@evaluation: pretraining
   - _self_
+base_lr: 1e-4
 runner:
     test_evaluations: ${exp.evaluation.test_evaluations}
-    lr: 1e-4
+    lr: null
     optim: LAMB
     train_batch_size: 256
     valid_batch_size: 256

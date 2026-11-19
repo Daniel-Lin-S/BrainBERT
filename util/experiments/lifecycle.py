@@ -9,6 +9,7 @@ Small logs live at logs/<campaign>/<invocation>/{status,training,errors}/.
 Scientific identity excludes placement, device, workers, and logging options.
 """
 
+import copy
 import fcntl
 import json
 import logging
@@ -21,6 +22,8 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from .storage import digest, file_digest, write_json
+
+REFERENCE_BATCH_SIZE = 256
 
 SCIENTIFIC_RUNNER = {
     "early_stopping_patience", "seed", "parent_checkpoint_sha256",
@@ -75,8 +78,33 @@ DATA_PLACEMENT = {
 }
 
 
+def resolve_batch_scaled_lr(cfg: object) -> None:
+    """Resolve the default rate from the optimizer batch before fit hashing.
+
+    Parameters
+    ----------
+    cfg : DictConfig
+        Experiment configuration. Explicit runner learning rates take priority.
+    """
+    exp = cfg.exp
+    if "base_lr" not in exp or exp.runner.lr is not None:
+        return
+    base_lr = exp.base_lr
+    batch = exp.runner.train_batch_size
+    if (not isinstance(base_lr, (int, float)) or isinstance(base_lr, bool)
+            or not math.isfinite(base_lr) or base_lr <= 0):
+        raise ValueError("Experiment base_lr must be finite and positive.")
+    if type(batch) is not int or batch <= 0:
+        raise ValueError("Experiment train_batch_size must be positive.")
+    lr = base_lr * batch / REFERENCE_BATCH_SIZE
+    if not math.isfinite(lr) or lr <= 0:
+        raise ValueError("Effective experiment learning rate is invalid.")
+    exp.runner.lr = lr
+
+
 def scientific_config(cfg: object, dataset: object, splits: dict) -> dict:
     """Collect scientific settings and verified source/split content."""
+    resolve_batch_scaled_lr(cfg)
     runner = OmegaConf.to_container(cfg.exp.runner, resolve=True)
     unknown = set(runner) - SCIENTIFIC_RUNNER - OPERATIONAL_RUNNER
     if unknown:
@@ -114,6 +142,35 @@ def scientific_config(cfg: object, dataset: object, splits: dict) -> dict:
     return result
 
 
+def scientific_default_variants(scientific: dict) -> list[dict]:
+    """Return configurations equivalent under established defaults.
+
+    Parameters
+    ----------
+    scientific : dict
+        Resolved scientific settings; ramp-up decay defaults to False.
+
+    Returns
+    -------
+    list of dict
+        The original settings and an equivalent legacy form, if applicable.
+    """
+    variants = [scientific]
+    scheduler = scientific.get("runner", {}).get("scheduler", {})
+    if scheduler.get("name") != "ramp_up":
+        return variants
+    if "decay" in scheduler and scheduler["decay"] is not False:
+        return variants
+    alternate = copy.deepcopy(scientific)
+    options = alternate["runner"]["scheduler"]
+    if "decay" in options:
+        del options["decay"]
+    else:
+        options["decay"] = False
+    variants.append(alternate)
+    return variants
+
+
 class FitRun:
     """Own a shared fit lock and the small records for one invocation."""
 
@@ -132,6 +189,13 @@ class FitRun:
         self.fit_id = digest(scientific)
         self.scientific = scientific
         self.path = self.root / "fits" / self.fit_id
+        if not self.path.exists():
+            for alternate in scientific_default_variants(scientific)[1:]:
+                alternate_id = digest(alternate)
+                if (self.root / "fits" / alternate_id).exists():
+                    self.fit_id = alternate_id
+                    self.path = self.root / "fits" / alternate_id
+                    break
         self.invocation = (
             datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
             + "-"
@@ -179,10 +243,9 @@ class FitRun:
                 not name.startswith("monitoring/") for name in additional
             ):
                 raise ValueError("Completion record has missing artifacts.")
-            if (
-                json.loads((self.path / "scientific.json").read_text())
-                != self.scientific
-            ):
+            saved = json.loads((self.path / "scientific.json").read_text())
+            if (digest(saved) != self.fit_id or saved not in
+                    scientific_default_variants(self.scientific)):
                 raise ValueError("Completed scientific configuration differs.")
             for name, expected in record["artifacts"].items():
                 candidate = (self.path / name).resolve()
@@ -227,7 +290,9 @@ class FitRun:
             for path in (scientific_path, last_path, best_path)
         ):
             return False
-        if json.loads(scientific_path.read_text()) != self.scientific:
+        saved = json.loads(scientific_path.read_text())
+        if (digest(saved) != self.fit_id or saved not in
+                scientific_default_variants(self.scientific)):
             return False
         if self.scientific["runner"].get("shuffle", False):
             return False
