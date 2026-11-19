@@ -158,6 +158,8 @@ NEVER interpret a raw mean performance difference as genuine improvement.
 
 Raw performance metric differences (effect sizes) and statistical tests should BOTH be reported.
 
+Statistical tests MUST retain the magnitude of paired metric differences. Rank-based and sign-only tests (including Wilcoxon and the sign test) are NOT permitted. Use the raw paired mean difference as the test statistic and report its effect size and confidence interval.
+
 - perform test on paired train-test splits, NOT the random seed repeats
 
 AVOID Holm-correction across multiple pairs of model comparisons or task comparisons. Because these are independent comparisons, and may create a p-value measure whose theoretical minimal value is already large. Applying Holm-correction across different metrics within each task is reasonable.
