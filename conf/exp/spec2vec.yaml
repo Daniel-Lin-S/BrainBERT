@@ -21,5 +21,6 @@ runner:
     scheduler:
         #name: reduce_on_plateau
         name: ramp_up
+        decay: false
         total_steps: ${exp.runner.total_steps}
         warmup: 0.025
