@@ -91,6 +91,7 @@ TABLES = (
     "mask_groups",
     "frequency_coverage",
     "validation_rank",
+    "validation_unmasked",
     "validation_frequency",
     "test_rank",
     "test_frequency",
@@ -653,6 +654,40 @@ def learning_figures(report: Report, history: dict) -> None:
             fig,
             "Diversity of pooled masked-window embeddings",
         )
+
+
+    unmasked_figures(report, history)
+
+
+def unmasked_figures(report: Report, history: dict) -> None:
+    """Plot observed unmasked validation checkpoints with explicit gaps."""
+    if "validation_unmasked" not in history:
+        return
+    observed = history["validation_unmasked"]
+    steps = history["metrics"].query("phase == 'validation'")[["step"]]
+    if observed.duplicated("step").any():
+        raise ValueError("Duplicate unmasked validation steps.")
+    frame = steps.drop_duplicates().merge(
+        observed, on="step", how="left", validate="one_to_one"
+    ).sort_values("step")
+    for metric, ylabel, title in (
+        ("feature_sd", "Feature standard deviation",
+         "Unmasked validation feature variation"),
+        ("normalized_attention_entropy", "Normalized attention entropy",
+         "Unmasked validation attention entropy"),
+    ):
+        columns = [f"{metric}_{key}" for key in ("median", "q1", "q3")]
+        if not all(column in frame for column in columns):
+            raise ValueError(f"Incomplete unmasked monitor: {metric}")
+        fig, ax = plt.subplots(figsize=(12, 7))
+        ax.plot(frame.step, frame[columns[0]], lw=2, marker="o",
+                markersize=4, label="Median")
+        ax.fill_between(frame.step.to_numpy(), frame[columns[1]].to_numpy(),
+                        frame[columns[2]].to_numpy(), alpha=0.2,
+                        label="Q1–Q3")
+        ax.set_ylabel(ylabel)
+        report.step_axis(ax)
+        report.figure(f"validation/representation/{metric}", fig, title)
 
 
 def report_fit(report: Report) -> Path:

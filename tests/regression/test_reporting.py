@@ -367,3 +367,38 @@ def test_parent_history_cutoff_and_current_test_isolation(tmp_path):
     torch.save({"completed_steps": 20}, checkpoint)
     with pytest.raises(ValueError, match="checksum"):
         load_history(child)
+
+
+def test_unmasked_plots_omit_missing_validation_steps(tmp_path, monkeypatch):
+    from util.experiments.reporting import unmasked_figures
+
+    metrics = pd.DataFrame({
+        "phase": ["validation"] * 3, "step": [10, 20, 30],
+        "total_loss": [1., 1., 1.], "l1": [1., 1., 1.],
+        "content_l1": [1., 1., 1.], "relative_l1": [1., 1., 1.],
+        "relative_content_l1": [1., 1., 1.], "std_ratio": [1., 1., 1.],
+    })
+    monitor = pd.DataFrame({"step": [10, 30], **{
+        f"{metric}_{key}": [0.2, 0.4]
+        for metric in ("feature_sd", "normalized_attention_entropy")
+        for key in ("mean", "median", "q1", "q3", "minimum")
+    }})
+    report = Report(tmp_path, Path("fit"), 30, [], settings={
+        "formats": ["png"], "splits": ["validation"],
+        "figures": ["representation_rank"], "tables": [],
+    })
+    captured = {}
+    def capture(name, figure, meaning):
+        if name.endswith(("feature_sd", "normalized_attention_entropy")):
+            captured[name] = figure
+    monkeypatch.setattr(report, "figure", capture)
+    unmasked_figures(report, {"metrics": metrics,
+                              "validation_unmasked": monitor})
+    assert len(captured) == 2
+    for fig in captured.values():
+        assert len(fig.axes[0].lines) >= 1
+        for line in fig.axes[0].lines[:1]:
+            assert list(line.get_xdata()) == [10, 20, 30]
+            assert np.isnan(line.get_ydata()[1])
+    import matplotlib.pyplot as plt
+    plt.close("all")
