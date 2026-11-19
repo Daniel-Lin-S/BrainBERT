@@ -94,6 +94,8 @@ You should parallelise independent neural fits whenever possible. Independent ex
 
 For multi-stage experiment with cross-stage dependencies, DONT parallelise.
 
+If not explicitly instructed on queue prioritisation, please prioritise CHEAPER tasks / jobs.
+
 ## Computational efficiency and memory usage
 
 Cache and reuse intermediate results that are shared for multiple times. This includes cleaned neural recordings, features extracted by pre-trained mdoels used for several times, models sharing the same initial stages etc.
@@ -121,6 +123,8 @@ NEVER use invocation parameters (number of devices, GPU/CPU settings, etc.) that
 NEVER use the entire python tree to hash the fit identity. If implementation of a scientific module changes and that has significant effect on the results (test by minimal validation), then reflect this scientific change in the configuration.
 
 Changing the hashing mechanism or minor code implementations (e.g., file tree organisation) should NOT invalidate previous completed fits.
+
+When new configuration fields are added, they should NOT invalidate previous fits without that field. An agreed default value should be used to compare the 2 versions of identities, and identify previously completed runs.
 
 Configurations under `configs` are intended to save human readable experiment configurations, NOT machine-generated hashes.
 
@@ -155,6 +159,10 @@ DONT attempt the other extreme -- creating too many folders and only place one f
 ## Evaluation and performance metrics
 
 NEVER interpret a raw mean performance difference as genuine improvement.
+
+Any statistical test whose test statistic obscures magnitude of metric difference is NOT allowed (e.g., some rank-based tests)
+
+- to be more specific, it should NOT only dependent on which model is better in test performance, as a large metric difference and a small difference should clearly lead to different conclusions.
 
 Raw performance metric differences (effect sizes) and statistical tests should BOTH be reported.
 
@@ -229,3 +237,9 @@ DO NOT document about the development cycles. If an initial implementation A is 
 
 - similarly, you should NOT save and commit diagnostics audits, smoke test results, temporary fixes etc.
 - If you are not sure, ASK ME rather than assuming a new feature is supposed to be added to this repository as permenant.
+
+## BrainBERT experiments
+
+There are many experiments under `conf/exp`, some for pre-training, and some for fine-tuning. When asked to modify a default setting for all experiments, you should change ALL related experiments rather than just the `spec2vec.yaml` or just a single experiment configuration.
+
+However, please mind that pre-training and fine-tuning are DIFFERENT training experiments and should NOT be confused.
