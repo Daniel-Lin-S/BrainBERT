@@ -337,6 +337,86 @@ def embedding_rank(embeddings: np.ndarray) -> dict:
     }
 
 
+UNMASKED_BATCH_SIZE = 8
+
+
+def distribution(values: torch.Tensor) -> dict:
+    """Summarize a finite one-dimensional population using linear quartiles."""
+    if values.ndim != 1 or not values.numel() or not values.isfinite().all():
+        raise ValueError("Expected a nonempty finite metric vector.")
+    q1, median, q3 = np.quantile(values.numpy(), [0.25, 0.5, 0.75])
+    return dict(mean=float(values.mean()), median=float(median),
+                q1=float(q1), q3=float(q3), minimum=float(values.min()))
+
+
+class UnmaskedValidation:
+    """Pool final-layer window embeddings and valid-query attention entropy."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self.model = model
+        self.embeddings = []
+        self.frames = 0
+        self.head_sums = None
+
+    @torch.inference_mode()
+    def add(self, targets: torch.Tensor, padding: torch.Tensor) -> None:
+        """Observe unmasked STFTs (B,T,F) and their padding flags (B,T)."""
+        device = next(self.model.parameters()).device
+        layer = self.model.transformer.layers[-1]
+
+        def request_weights(module, args, kwargs):
+            kwargs.update(need_weights=True, average_attn_weights=False)
+            return args, kwargs
+
+        def measure_attention(module, args, result):
+            probs = result[1].float()
+            entropy = -torch.special.xlogy(probs, probs).sum(-1)
+            entropy /= lengths.float().log()[:, None, None]
+            totals = entropy.masked_fill(~valid[:, None], 0).sum(
+                (0, 2), dtype=torch.float64
+            ).cpu()
+            if self.head_sums is None:
+                self.head_sums = totals
+            else:
+                self.head_sums += totals
+
+        attention = layer.self_attn
+        pre = attention.register_forward_pre_hook(
+            request_weights, with_kwargs=True
+        )
+        post = attention.register_forward_hook(measure_attention)
+        try:
+            for x, mask in zip(targets.split(UNMASKED_BATCH_SIZE),
+                               padding.split(UNMASKED_BATCH_SIZE)):
+                mask = mask.to(device)
+                valid = ~mask
+                lengths = valid.sum(1)
+                if (lengths < 2).any():
+                    raise ValueError("Normalized entropy needs two valid keys.")
+                hidden = self.model(x.to(device), mask, intermediate_rep=True)
+                pooled = hidden.masked_fill(mask[:, :, None], 0).sum(1)
+                embedding = pooled / lengths[:, None]
+                self.embeddings.append(embedding.cpu().double())
+                self.frames += int(lengths.sum())
+        finally:
+            pre.remove()
+            post.remove()
+
+    def summary(self) -> dict:
+        """Return per-dimension SD and per-head normalized entropy."""
+        if not self.frames:
+            raise ValueError("No valid frames in unmasked validation.")
+        features = torch.cat(self.embeddings)
+        sd = features.std(0, correction=0)
+        entropy = self.head_sums / self.frames
+        return dict(layer=len(self.model.transformer.layers),
+                    frames=self.frames,
+                    windows=len(features), feature_sd=distribution(sd),
+                    normalized_attention_entropy=distribution(entropy),
+                    entropy_by_head=entropy.tolist(),
+                    sd_by_dimension=sd.tolist())
+
+
 class TrainingMonitor:
     """Write compact diagnostics underneath one new fit's artifact root."""
 
@@ -565,6 +645,18 @@ class TrainingMonitor:
             self.start_step = step + 1
         if self.writer is not None and plot_images:
             self._heatmap(context, grid)
+        self.flush()
+
+    def record_unmasked(self, step: int, result: dict) -> None:
+        """Persist final-layer distribution summaries at the validation step."""
+        row = dict(phase="validation", step=step, layer=result["layer"],
+                   windows=result["windows"], frames=result["frames"])
+        for metric in ("feature_sd", "normalized_attention_entropy"):
+            row.update({f"{metric}_{key}": value
+                        for key, value in result[metric].items()})
+        self._row("validation_unmasked", row, tag="unmasked")
+        write_json(self.root / "unmasked_validation" / f"step_{step:08d}.json",
+                   dict(step=step, **result))
         self.flush()
 
     def record_rank(

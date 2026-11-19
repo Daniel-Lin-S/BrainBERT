@@ -30,7 +30,7 @@ class SpecPretrain(BaseTask):
     def get_valid_outs(
         self, model, valid_loader, criterion, device,
         rank_indices=None, collect_frequency=False,
-        progress_callback=None,
+        progress_callback=None, unmasked=None,
     ):
         """Evaluate one pass and optionally collect bounded embeddings.
 
@@ -50,6 +50,9 @@ class SpecPretrain(BaseTask):
             Collect frequency sufficient statistics, default False.
         progress_callback : callable, optional
             Receives completed and total batch counts, default None.
+
+        unmasked : UnmaskedValidation or None, optional
+            Accumulate final-layer diagnostics on clean targets, default None.
 
         Returns
         -------
@@ -91,6 +94,11 @@ class SpecPretrain(BaseTask):
                         valid_outs.pop("window_embeddings")
                         .cpu().numpy()
                     )
+                if unmasked is not None:
+                    rows = selected if rank_indices is not None else range(size)
+                    if len(rows):
+                        unmasked.add(batch["target"][rows],
+                                     batch["attn_mask"][rows])
                 offset += size
                 if "monitor_statistics" in valid_outs:
                     monitor.add(valid_outs)

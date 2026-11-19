@@ -30,7 +30,7 @@ from util.experiments.monitoring import (
     Accumulator, TrainingMonitor, diagnostic_names, rank_positions,
 )
 from util.experiments.storage import (
-    atomic_write, publish_training_completion, write_json,
+    atomic_write, digest, publish_training_completion, write_json,
 )
 
 STATUS_STEP_INTERVAL = 10
@@ -111,6 +111,7 @@ class Runner:
         self.logger = None
         self.monitor = None
         self.rank_indices = None
+        self.unmasked_pin = None
         self.best_step = None
         self.best_validation_loss = None
         if self.output_tb and task.cfg.name != "spec_pretrain":
@@ -150,6 +151,7 @@ class Runner:
         elif "start_from_ckpt" in cfg:
             self.load_from_ckpt(cfg.start_from_ckpt)
 
+        self.monitor_start_step = self.completed_steps
         if task.cfg.name == "spec_pretrain":
             from criterions.pretrain_masked_criterion import CONTENT_THRESHOLD
             from preprocessors import STFTPreprocessor
@@ -317,11 +319,29 @@ class Runner:
             "validation", done, total
         )
         if self.monitor is not None:
-            return self.task.get_valid_outs(
+            from models.masked_tf_model import MaskedTFModel
+            from util.experiments.monitoring import UnmaskedValidation
+
+            model = (self.model.module if isinstance(
+                self.model, torch.nn.DataParallel) else self.model)
+            unmasked = None
+            if (isinstance(model, MaskedTFModel)
+                    and self.completed_steps > self.monitor_start_step
+                    and self.unmasked_pin is not None):
+                unmasked = UnmaskedValidation(model)
+            result = self.task.get_valid_outs(
                 self.model, valid_loader, self.criterion, self.device,
                 rank_indices=self.rank_indices, collect_frequency=True,
                 progress_callback=progress,
+                **({"unmasked": unmasked} if unmasked is not None else {}),
             )
+            if unmasked is not None:
+                summary = unmasked.summary()
+                if summary["windows"] != self.unmasked_pin["windows"]:
+                    raise ValueError("Incomplete unmasked validation subset.")
+                summary.update(self.unmasked_pin)
+                self.monitor.record_unmasked(self.completed_steps, summary)
+            return result
         if self.task.cfg.name == "spec_pretrain":
             return self.task.get_valid_outs(
                 self.model, valid_loader, self.criterion, self.device,
@@ -719,6 +739,16 @@ class Runner:
                     {"validation_windows": windows,
                      "positions": self.rank_indices.tolist()},
                 )
+            positions = list(range(windows)) if windows < 2 else [
+                int(index) for index in self.rank_indices
+            ]
+            source = self.task.valid_set
+            while isinstance(source, Subset):
+                positions = [int(source.indices[i]) for i in positions]
+                source = source.dataset
+            self.unmasked_pin = {
+                "windows": len(positions), "windows_sha256": digest(positions),
+            }
         train_loader = self.get_batch_iterator(
             self.task.train_set,
             self.cfg.train_batch_size,

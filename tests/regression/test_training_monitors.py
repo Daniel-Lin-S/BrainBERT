@@ -833,3 +833,48 @@ def test_training_readiness_precedes_diagnostics(tmp_path):
     torch.save(last, checkpoints / "checkpoint_last.pth")
     publish_training_completion(checkpoints, 10)
     assert marker.exists()
+
+
+def test_unmasked_validation_in_default_runner(tmp_path):
+    """Clean targets at a new optimizer step reach CSV, JSON and events."""
+    import models
+
+    task = SpecPretrain(OmegaConf.create({"name": "spec_pretrain"}))
+    task.dataset = SimpleNamespace(extracter=STFTPreprocessor(
+        OmegaConf.load(ROOT / "conf/preprocessor/stft.yaml")
+    ))
+    examples = [example() for _ in range(4)]
+    task.train_set = Subset(examples, [0, 1])
+    task.valid_set = Subset(examples, [2, 3])
+    criterion = PretrainMaskedCriterion()
+    criterion.build_criterion(OmegaConf.create({"alpha": 2.0}))
+    cfg = OmegaConf.create(dict(
+        artifact_dir=str(tmp_path / "checkpoints"), device="cpu",
+        multi_gpu=False, quiet=True, optim="SGD", lr=0.001, total_steps=2,
+        log_step=1, checkpoint_step=1, train_batch_size=2,
+        valid_batch_size=2, num_workers=0, shuffle=False, grad_clip=1.0,
+        scheduler=dict(name="ramp_up", warmup=0.5, total_steps=2),
+    ))
+    model = models.build_model(OmegaConf.create(dict(
+        name="masked_tf_model", hidden_dim=40, input_dim=40, nhead=4,
+        layer_dim_feedforward=64, layer_activation="gelu", encoder_num_layers=2,
+    )))
+    runner = Runner(cfg, task, model, criterion)
+    try:
+        runner.train()
+    finally:
+        runner.monitor.close()
+        runner.progress.close()
+    root = tmp_path / "monitoring"
+    result = json.loads(
+        (root / "unmasked_validation/step_00000001.json").read_text()
+    )
+    assert result["layer"] == 2 and result["windows"] == 2
+    rows = read_rows(root, "validation_unmasked.csv")
+    assert len(rows) == 2 and int(rows[0]["step"]) == 1
+    events = EventAccumulator(str(root / "tensorboard"))
+    events.Reload()
+    for metric in ("feature_sd", "normalized_attention_entropy"):
+        for key in ("mean", "median", "q1", "q3", "minimum"):
+            recorded = events.Scalars(f"validation/unmasked/{metric}_{key}")
+            assert recorded[0].value == pytest.approx(result[metric][key])
