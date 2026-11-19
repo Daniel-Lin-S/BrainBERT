@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from data.ajile.core import POLICY, waveform
+from data.ajile.core import OUTPUT, POLICY, waveform
 from data.ajile.normalization import (
     dataset_statistics,
     eligibility,
@@ -33,6 +33,35 @@ from util.experiments.storage import digest
 RAW_STFT_NAMESPACE = "ajile_raw_stft"
 SELECTION_NAMESPACE = "ajile12"
 SELECTION_REVISION = "ajile-budgeted-v2"
+
+
+def training_moment_table(
+    path: Path, channels: int, bins: int, frames: int, expected: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Read a selected session table after verifying its target dimensions.
+
+    Mean and standard deviation have shape (channels, bins). Counts are
+    numbers of frames per channel and must sum to the selected frame total.
+    Inactive electrodes can have undefined normalization parameters.
+    """
+    with np.load(path, allow_pickle=False) as saved:
+        count, mean, std = (
+            saved[name] for name in ("count", "mean", "std")
+        )
+    if (count.shape != (channels,) or count.dtype.kind not in "iu"
+            or np.any(count < 0) or np.any(count % frames)
+            or int(count.sum()) != expected):
+        raise ValueError(
+            f"Expected {expected} training frames in per-electrode "
+            f"counts for {path}, got {count}."
+        )
+    active = count > 0
+    if (mean.shape != (channels, bins) or std.shape != mean.shape
+            or not np.isfinite(mean[active]).all()
+            or not np.isfinite(std[active]).all()
+            or np.any(std[active] <= 0)):
+        raise ValueError(f"Invalid active-electrode moments: {path}")
+    return mean, std, int(count.sum())
 
 
 class SessionIndices:
@@ -224,6 +253,82 @@ class AJILE12(Dataset):
         self.eval_indices = set(
             self.selection["validation"] + self.selection["test"]
         )
+
+    def cached_training_baseline(self, indices: list[int]) -> dict | None:
+        """Derive the frequency mean for equally weighted fitted z-scores.
+
+        Parameters
+        ----------
+        indices : list of int
+            Global window indices in the requested target subset.
+
+        Returns
+        -------
+        dict or None
+            Mean of shape (frequencies,), valid frame count and provenance.
+            None requests a direct scan if the fitted population differs
+            or its moments are unavailable. Float32 target rounding is
+            omitted when averaging the centered population algebraically.
+        """
+        from data.ajile.sampling import selected_moment_path
+
+        if (not self.selected_train
+                or self.extracter.cfg.normalizing != "recording_zscore"):
+            return None
+        selected = self.selection["train"]
+        if len(indices) != len(selected):
+            return None
+        ordered = np.sort(indices)
+        if indices is not selected and not np.array_equal(
+            ordered, np.sort(selected)
+        ):
+            return None
+        if (ordered.size == 0 or ordered[0] < 0
+                or ordered[-1] >= len(self)
+                or np.any(ordered[1:] == ordered[:-1])):
+            return None
+        evaluation = np.fromiter(self.eval_indices, dtype=np.int64)
+        eval_sessions = set(np.searchsorted(
+            self.ends, evaluation, side="right"
+        ))
+        # Use the target extractor's trimming and frame geometry once.
+        frames, bins = self.extracter.unnormalized(
+            np.zeros(OUTPUT - 1, dtype=np.float32)
+        ).shape
+        boundaries = ordered.searchsorted(self.ends)
+        start = frame_count = 0
+        keys = []
+        for session, stop in enumerate(boundaries):
+            if stop == start:
+                continue
+            record = self.records[session]
+            if (session in eval_sessions
+                    or record["session"] not in self.partitions["train"]):
+                return None
+            path = selected_moment_path(
+                self, record, ordered[start:stop].tolist()
+            )
+            if not path.is_file():
+                return None
+            mean, std, count = training_moment_table(
+                path, record["metadata"]["channels"], bins, frames,
+                int(stop - start) * frames,
+            )
+            applied = self.selected_statistics.get(record["session"])
+            if applied is not None and any(
+                not np.array_equal(applied[k], array, equal_nan=True)
+                for k, array in (("mean", mean), ("std", std))
+            ):
+                return None
+            keys.append(path.stem)
+            frame_count += count
+            start = stop
+        return {
+            "mean": np.zeros(bins).tolist(),
+            "frame_count": frame_count,
+            "source": "algebraic mean of training-selection z-scores",
+            "moment_keys_sha256": digest(keys),
+        }
 
     def raw_spectrum(
         self, index: int, wav: np.ndarray = None

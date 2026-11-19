@@ -145,7 +145,9 @@ def test_missing_recording_statistics_fail_clearly():
     assert window.shape == (186, 40)
 
 
-def test_ajile_dataset_applies_cached_recording_statistics(tmp_path):
+@pytest.fixture
+def small_dataset(tmp_path):
+    """Provide one audited session with two eligible windows per electrode."""
     source_root = tmp_path / "source"
     source_root.mkdir()
     audit = tmp_path / "audit"
@@ -208,6 +210,12 @@ def test_ajile_dataset_applies_cached_recording_statistics(tmp_path):
         task_cfg=task,
         preprocessor_cfg=preprocessing,
     )
+    return dataset
+
+
+def test_ajile_dataset_applies_cached_recording_statistics(small_dataset):
+    dataset = small_dataset
+    session = dataset.records[0]["session"]
     first = dataset[0]
     stats = dataset.statistics
     assert len(dataset) == 4
@@ -242,6 +250,53 @@ def test_ajile_dataset_applies_cached_recording_statistics(tmp_path):
     np.testing.assert_array_equal(
         dataset[3]["mask_label"], first_eval["mask_label"]
     )
+
+
+def test_selected_training_baseline_reuses_matching_moments(
+    small_dataset, tmp_path,
+):
+    """Compare all direct float32 targets and exclude unequal populations."""
+    from torch.utils.data import Subset
+    from data.ajile.sampling import selected_moment_path
+    from util.experiments.fixed_mask_diagnostics import training_baseline
+
+    dataset = small_dataset
+    indices = [3, 1, 2, 0]
+    selection = {"indices": {"train": indices, "validation": [], "test": []}}
+    dataset.configure_selection(selection)
+    assert dataset.cached_training_baseline(indices) is None
+    dataset.prepare_selected(selection)
+    dataset.task_cfg.diagnostic_targets_only = True
+    targets = np.concatenate([dataset[i]["target"].numpy() for i in indices])
+    with patch.object(dataset, "raw_spectrum", side_effect=AssertionError):
+        cached = training_baseline(
+            None, Subset(dataset, indices), 1, 0, tmp_path,
+            {"selection": "example"}, None, None,
+        )
+    assert cached["identity"] == {"selection": "example"}
+    assert cached["frame_count"] == targets.shape[0]
+    np.testing.assert_allclose(
+        cached["mean"], targets.mean(axis=0, dtype=np.float64), atol=1e-8,
+    )
+    reordered = dataset.cached_training_baseline(sorted(indices))
+    assert reordered["moment_keys_sha256"] == cached["moment_keys_sha256"]
+    assert dataset.cached_training_baseline(indices[:-1]) is None
+    dataset.configure_selection({
+        "indices": {**selection["indices"], "train": indices + indices[:1]}
+    })
+    assert dataset.cached_training_baseline(indices + indices[:1]) is None
+    dataset.configure_selection({
+        "indices": {**selection["indices"], "test": [0]}
+    })
+    assert dataset.cached_training_baseline(indices) is None
+    dataset.configure_selection(selection)
+    path = selected_moment_path(dataset, dataset.records[0], sorted(indices))
+    with np.load(path) as table:
+        fields = dict(table)
+    fields["count"][0] += 1
+    np.savez(path, **fields)
+    with pytest.raises(ValueError, match="training frames"):
+        dataset.cached_training_baseline(indices)
 
 
 def test_dataset_moments_are_electrode_specific_and_train_only(tmp_path):

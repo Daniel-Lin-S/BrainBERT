@@ -78,6 +78,19 @@ def select_evaluation_group(
     return sorted(chosen)
 
 
+def selected_moment_path(
+    dataset: object, record: dict, indices: list[int],
+) -> Path:
+    """Locate moments fitted on the sorted global indices of one session."""
+    key = digest({
+        "source": record["content_id"],
+        "indices": indices,
+        "preprocessor": dataset.cache_settings(),
+    })
+    root = Path(dataset.extracter.cfg.feature_cache).resolve()
+    return root / "ajile_selected_stats" / f"{key}.npz"
+
+
 def _prepare_session(
     dataset: object, session: int, indices: list[int]
 ) -> tuple[str, dict]:
@@ -90,14 +103,7 @@ def _prepare_session(
     frequencies = len(dataset.extracter.frequency_axis())
     record = dataset.records[session]
     indices.sort()
-    selected_id = digest({
-        "source": record["content_id"],
-        "indices": indices,
-        "preprocessor": dataset.cache_settings(),
-    })
-    path = root / "ajile_selected_stats" / (
-        selected_id + ".npz"
-    )
+    path = selected_moment_path(dataset, record, indices)
     dataset.active = session
     dataset.valid = eligibility(dataset.audit, record)
     dataset.positions = np.flatnonzero(dataset.valid)

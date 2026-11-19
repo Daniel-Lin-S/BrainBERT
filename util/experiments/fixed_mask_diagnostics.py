@@ -320,7 +320,7 @@ def training_baseline(
     task: Any, dataset: Any, size: int, workers: int, root: Path,
     identity: dict, progress: Callable, smoke_batches: int | None,
 ) -> dict:
-    """Stream training targets once, retaining resumable frequency sums.
+    """Reuse matching normalization moments or stream target frequency sums.
 
     Dataset entries contain targets (T, F); the result contains a frozen
     mean (F,), valid-frame count and the exact selection identity. Partial
@@ -339,6 +339,14 @@ def training_baseline(
             raise ValueError("Partial training baseline provenance differs.")
         offset, count = partial["windows"], partial["count"]
         sums = torch.tensor(partial["sums"], dtype=torch.float64)
+    if (smoke_batches is None
+            and isinstance(dataset, torch.utils.data.Subset)):
+        derive = getattr(dataset.dataset, "cached_training_baseline", None)
+        if derive is not None:
+            cached = derive(dataset.indices)
+            if cached is not None:
+                return {**cached, "identity": identity}
+
     total = math.ceil(len(dataset) / size)
     subset = torch.utils.data.Subset(dataset, range(offset, len(dataset)))
     loader = task.get_batch_iterator(
