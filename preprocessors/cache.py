@@ -95,13 +95,18 @@ def cached_raw_stft(
     path = raw_stft_path(
         root, namespace, source_id, position, cfg
     )
+    return load_raw_stft(path, cfg.freq_channel_cutoff, extract)
+
+
+def load_raw_stft(path: Path, bins: int, extract: Callable) -> torch.Tensor:
+    """Load the addressed (frames, bins) spectrum, extracting on a miss."""
     try:
         values = np.load(path, allow_pickle=False)
     except FileNotFoundError:
         values = extract().detach().cpu().numpy()
         if (
             values.ndim != 2
-            or values.shape[1] != cfg.freq_channel_cutoff
+            or values.shape[1] != bins
             or not np.isfinite(values).all()
         ):
             raise ValueError(
@@ -117,7 +122,7 @@ def cached_raw_stft(
         values = np.load(path, allow_pickle=False)
     if (
         values.ndim != 2
-        or values.shape[1] != cfg.freq_channel_cutoff
+        or values.shape[1] != bins
         or not np.isfinite(values).all()
     ):
         raise ValueError(f"Invalid raw STFT cache: {path.resolve()}")

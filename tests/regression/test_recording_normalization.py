@@ -1,6 +1,7 @@
 """Verify split-local recording normalization on synthetic AJILE windows."""
 
 import json
+import os
 import random
 from pathlib import Path
 from unittest.mock import patch
@@ -250,6 +251,39 @@ def test_ajile_dataset_applies_cached_recording_statistics(small_dataset):
     np.testing.assert_array_equal(
         dataset[3]["mask_label"], first_eval["mask_label"]
     )
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "posix_fadvise"), reason="Linux hints"
+)
+def test_batch_readahead_preserves_selection_order_and_rng(small_dataset):
+    """A loader batch must reproduce scalar reads, even with repeats."""
+    import torch
+    from torch.utils.data import DataLoader, Subset
+
+    dataset = small_dataset
+    indices = [3, 1, 2, 0, 1]
+    pin = {"indices": {"train": indices, "test": [], "validation": []}}
+    dataset.configure_selection(pin)
+    dataset.prepare_selected(pin)
+    random.seed(194)
+    expected = [dataset[i] for i in indices]
+    rng_after = random.getstate()
+    random.seed(194)
+    loader = DataLoader(
+        Subset(dataset, indices), batch_size=len(indices),
+        collate_fn=list,
+    )
+    with patch("os.posix_fadvise", wraps=os.posix_fadvise) as advise:
+        actual = next(iter(loader))
+    assert advise.call_count == len(indices)
+    assert random.getstate() == rng_after
+    for a, b in zip(actual, expected, strict=True):
+        for key in ("masked_input", "mask_label", "target"):
+            assert torch.equal(a[key], b[key])
+        for key in a["mask_provenance"]:
+            assert torch.equal(a["mask_provenance"][key],
+                               b["mask_provenance"][key])
 
 
 def test_selected_training_baseline_reuses_matching_moments(

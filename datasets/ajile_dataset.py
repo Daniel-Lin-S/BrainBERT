@@ -6,7 +6,9 @@ batch dictionary. No model input contains a channel axis. Source placement
 and audit paths are local settings, not scientific identity.
 """
 
+import errno
 import json
+import os
 import random
 from bisect import bisect_right
 from pathlib import Path
@@ -25,7 +27,7 @@ from datasets import register_dataset
 from datasets.masked_tf_dataset import prepare_example
 from preprocessors import STFTPreprocessor
 from preprocessors.cache import (
-    cached_raw_positions, cached_raw_stft
+    cached_raw_positions, load_raw_stft, raw_stft_path
 )
 from util.experiments.storage import digest
 
@@ -126,6 +128,7 @@ class AJILE12(Dataset):
         self.selected_train = False
         self.selected_statistics = {}
         self.session_indices = {}
+        self.raw_cache_dirs = {}
         self.eval_indices = set()
         self.session_partition = {
             session: name
@@ -248,6 +251,7 @@ class AJILE12(Dataset):
 
     def configure_selection(self, selection: dict) -> None:
         """Attach frozen indices and evaluation mask membership."""
+        self.raw_cache_dirs.clear()
         self.selection = selection["indices"]
         self.selected_train = bool(self.selection["train"])
         self.eval_indices = set(
@@ -330,6 +334,60 @@ class AJILE12(Dataset):
             "moment_keys_sha256": digest(keys),
         }
 
+    def _raw_cache_dir(self, session: int) -> Path:
+        """Resolve the source and spectral settings once per recording."""
+        if session not in self.raw_cache_dirs:
+            cfg = self.extracter.cfg
+            self.raw_cache_dirs[session] = raw_stft_path(
+                Path(cfg.feature_cache).resolve(), RAW_STFT_NAMESPACE,
+                self.records[session]["content_id"], 0, cfg,
+            ).parent
+        return self.raw_cache_dirs[session]
+
+    def _index_session(self, session: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return the eligibility grid and flattened eligible positions."""
+        if session not in self.session_indices:
+            record = self.records[session]
+            valid = eligibility(self.audit, record)
+            positions = np.flatnonzero(valid)
+            if len(positions) != record["eligible"]:
+                raise ValueError(
+                    f"Expected {record['eligible']} eligible positions in "
+                    f"{record['session']}, got {len(positions)}."
+                )
+            self.session_indices[session] = valid, positions
+        return self.session_indices[session]
+
+    def __getitems__(self, indices: list[int]) -> list[dict]:
+        """Queue raw spectrum reads before consuming a pinned loader batch.
+
+        Linux can schedule outstanding cache misses together on a shared
+        disk. Examples and random masks are still produced in input order.
+        """
+        if self.selected_train and hasattr(os, "posix_fadvise"):
+            for index in indices:
+                if not 0 <= index < len(self):
+                    raise IndexError(index)
+                session = bisect_right(self.ends, index)
+                _, positions = self._index_session(session)
+                start = self.ends[session - 1] if session else 0
+                path = self._raw_cache_dir(session) / (
+                    f"{positions[index - start]}.npy"
+                )
+                try:
+                    with path.open("rb") as stream:
+                        os.posix_fadvise(
+                            stream.fileno(), 0, 0, os.POSIX_FADV_WILLNEED
+                        )
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOSYS, errno.EOPNOTSUPP,
+                                         errno.EINVAL):
+                        raise
+                    break
+        return [self[index] for index in indices]
+
     def raw_spectrum(
         self, index: int, wav: np.ndarray = None
     ) -> torch.Tensor:
@@ -353,11 +411,9 @@ class AJILE12(Dataset):
             )
             return self.extracter.unnormalized(signal[:-1])
 
-        return cached_raw_stft(
-            Path(self.extracter.cfg.feature_cache).resolve(),
-            RAW_STFT_NAMESPACE, record["content_id"],
-            position, self.extracter.cfg, extract,
-        )
+        path = self._raw_cache_dir(session) / f"{position}.npy"
+        return load_raw_stft(path, self.extracter.cfg.freq_channel_cutoff,
+                             extract)
 
     def get_input_dim(self) -> int:
         return self.extracter.cfg.freq_channel_cutoff
@@ -381,14 +437,7 @@ class AJILE12(Dataset):
         session = bisect_right(self.ends, index)
         record = self.records[session]
         if self.active != session:
-            if session not in self.session_indices:
-                valid = eligibility(self.audit, record)
-                self.session_indices[session] = (
-                    valid, np.flatnonzero(valid)
-                )
-            self.valid, self.positions = self.session_indices[session]
-            if len(self.positions) != record["eligible"]:
-                raise ValueError("AJILE eligibility index count differs.")
+            self.valid, self.positions = self._index_session(session)
             self.statistics = None
             full_train = (
                 not self.selected_train
