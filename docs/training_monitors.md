@@ -42,6 +42,18 @@ transformer layer for each window, centers those vectors, and reports:
 These embeddings come from the same masked inputs used for validation
 reconstruction. A zero-variance embedding set has rank zero.
 
+At validation following new optimizer updates, BrainBERT also evaluates the clean
+targets from those same windows (up to 2,048). It averages valid final-layer
+frames within each window and computes the population SD of each feature across
+windows. For each final-layer attention head, it averages query entropy divided
+by the log of the valid key count over all valid queries.
+
+`validation_unmasked.csv` and the TensorBoard group `validation/unmasked`
+report the mean, median, Q1, Q3 and minimum across feature SDs and across
+head entropies. The matching step JSON in `unmasked_validation/` includes
+individual dimension and head values and the validation window identity.
+A resumed fit writes these diagnostics in its new monitoring segment.
+
 ## Per-frequency validation reconstruction
 
 `validation_frequency.csv.gz` reports each STFT frequency separately for
